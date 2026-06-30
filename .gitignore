@@ -1,0 +1,5 @@
+.zig-cache
+zig-out
+test.mp3
+test2.mp3
+copy.sh
