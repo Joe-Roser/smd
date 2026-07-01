@@ -3,40 +3,48 @@ const PW = @import("pw_audio");
 const zio = @import("zio");
 const event = @import("event.zig");
 
+const Logger = @import("Logger.zig");
 const RB = PW.SPSC_f32;
 const Client = event.Client;
 const Epoll = zio.Epoll;
 
 pub const Sink = struct {
     client: *Client,
+    logger: Logger,
     rb: *RB,
     audio: PW = undefined,
     high_tide: bool = false,
     low_tide: u32,
 
-    pub fn init(client: *Client, rb: *RB) Sink {
+    pub fn init(client: *Client, logger: Logger, rb: *RB) Sink {
         const low_tide_percent = 0.2;
         return .{
+            .logger = logger,
             .client = client,
             .rb = rb,
             .low_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * low_tide_percent),
         };
     }
 
+    pub fn err(self: *Sink, erro: anyerror) void {
+        self.logger.log("{any}", .{erro}, .err);
+        self.client.broadcast_spinning(.err_unrecoverable);
+    }
+
     pub fn run(self: *Sink) void {
-        var audio = PW.init(.{ .channels = 2, .sample_rate = 48000 }, self.rb) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        var audio = PW.init(.{ .channels = 2, .sample_rate = 48000 }, self.rb) catch |e|
+            return self.err(e);
         defer audio.deinit();
 
         audio.pause();
 
-        var epoll = Epoll.init(.{}) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        var epoll = Epoll.init(.{}) catch |e|
+            return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
-        epoll.add(audio.getFd(), Epoll.IN, .{ .u64 = 1 }) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+            return self.err(e);
+        epoll.add(audio.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
+            return self.err(e);
 
         var events: [8]Epoll.Event = undefined;
         loop: while (true) {

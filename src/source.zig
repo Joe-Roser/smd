@@ -4,6 +4,7 @@ const zio = @import("zio");
 const event = @import("event.zig");
 const ff = @import("ffmpeg");
 
+const Logger = @import("Logger.zig");
 const RB = @import("pw_audio").SPSC_f32;
 const Client = event.Client;
 const Epoll = zio.Epoll;
@@ -44,6 +45,10 @@ const FFState = struct {
     pub fn deinit(self: *FFState) void {
         ff.av_packet_free(&self.pkt);
         ff.av_frame_free(&self.frame);
+    }
+    pub fn avError(err: i32) void {
+        // TODO:
+        _ = err;
     }
 
     fn initSong(self: *FFState, song_path: [*:0]const u8) !void {
@@ -91,7 +96,6 @@ const FFState = struct {
     }
     fn deinitSong(self: *FFState) void {
         if (self.conv_buf) |_| ff.av_freep(@ptrCast(&self.conv_buf.?));
-        self.conv_buf = null;
         self.conv_buffer_samples = 0;
 
         if (self.swr) |_| ff.swr_free(&self.swr);
@@ -100,7 +104,10 @@ const FFState = struct {
         if (self.codec_ctx) |_| ff.avcodec_free_context(&self.codec_ctx);
         self.codec_ctx = null;
         if (self.fmt_ctx) |_| ff.avformat_close_input(&self.fmt_ctx);
-        self.fmt_ctx = null;
+
+        self.frame_unfinished = false;
+        self.frame_len = 0;
+        self.frame_offset = 0;
     }
 
     /// Returns either EOF (music file ended) or WouldBlock (failed to write whole frame)
@@ -108,9 +115,9 @@ const FFState = struct {
         // Try write previous frame data
         if (self.frame_unfinished) {
             const buf: [*]f32 = if (self.needs_resampling)
-                @ptrCast(@alignCast(&self.conv_buf.?))
+                @ptrCast(@alignCast(self.conv_buf.?))
             else
-                @ptrCast(@alignCast(&self.frame.?.data[0]));
+                @ptrCast(@alignCast(self.frame.?.data[0]));
 
             const w = rb.write(buf[self.frame_offset..self.frame_len]);
             self.frame_offset += w;
@@ -136,9 +143,7 @@ const FFState = struct {
 
                     const read_frm = ff.av_read_frame(self.fmt_ctx, self.pkt);
                     if (read_frm < 0) {
-                        std.debug.print("No Packet\n", .{});
                         if (self.eof) {
-                            std.debug.print("Second no packet\n", .{});
                             return error.EOF;
                         } else self.eof = true;
                     } else {
@@ -176,7 +181,7 @@ const FFState = struct {
                     w = rb.write(@as([*]f32, @ptrCast(@alignCast(self.conv_buf.?)))[0..n_floats]);
                 } else {
                     n_floats = @as(u32, @intCast(self.frame.?.nb_samples * self.target_channels));
-                    const data: [*]f32 = @ptrCast(@alignCast(&self.frame.?.data[0][0]));
+                    const data: [*]f32 = @ptrCast(@alignCast(self.frame.?.data[0]));
                     w = rb.write(data[0..n_floats]);
                 }
                 // If didnt write the whole frame, means there wasn't enough space, so keep frame around,
@@ -197,34 +202,36 @@ const FFState = struct {
 
 pub const Source = struct {
     client: *Client,
+    logger: Logger,
     rb: *RB,
-    title: ?[:0]const u8,
+    title: ?[:0]const u8 = null,
 
     high_tide: u32,
 
-    pub fn init(client: *Client, rb: *RB) Source {
-        const high_tide_percent = 0.8;
+    pub fn init(client: *Client, logger: Logger, rb: *RB) Source {
+        const high_tide_percent = 0.9;
         return .{
             .client = client,
+            .logger = logger,
             .rb = rb,
             .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
-            .title = null,
         };
     }
 
-    fn process_audio(self: *Source) void {
-        _ = self;
+    pub fn err(self: *Source, erro: anyerror) void {
+        self.logger.log("{any}", .{erro}, .err);
+        self.client.broadcast_spinning(.err_unrecoverable);
     }
 
     pub fn run(self: *Source) void {
-        var epoll = Epoll.init(.{}) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        var epoll = Epoll.init(.{}) catch |e|
+            return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+            return self.err(e);
 
         var decoder = FFState.init() orelse
-            return self.client.broadcast_spinning(.err_unrecoverable);
+            return self.err(error.NoFFState);
         defer decoder.deinit();
         defer decoder.deinitSong();
 
@@ -234,8 +241,8 @@ pub const Source = struct {
             const n = epoll.wait(&events, epoll_wait) catch
                 continue :loop;
 
-            for (events[0..n]) |e|
-                switch (e.data.u64) {
+            for (events[0..n]) |ev|
+                switch (ev.data.u64) {
                     0 => {
                         var buf: [8]u8 = undefined;
                         _ = std.os.linux.read(self.client.fd, &buf, buf.len);
@@ -244,15 +251,16 @@ pub const Source = struct {
                             switch (r) {
                                 .quit, .err_unrecoverable => break :loop,
                                 .song_path_loaded => {
-                                    std.debug.print("Loaded\n", .{});
-                                    decoder.initSong(self.title.?.ptr) catch
-                                        return self.client.broadcast_spinning(.err_unrecoverable);
+                                    decoder.initSong(self.title.?.ptr) catch |e|
+                                        return self.err(e);
+
+                                    self.logger.log("Loaded", .{}, .debug);
                                     epoll_wait = 0;
                                 },
                                 .low_tide => {
                                     epoll_wait = 0;
                                 },
-                                .pause, .play => {},
+                                .play, .pause => {},
                                 .high_tide, .song_end => unreachable,
                             }
                         }
@@ -262,7 +270,7 @@ pub const Source = struct {
 
             if (epoll_wait == 0) {
                 for (0..5) |_| {
-                    decoder.writeFrame(self.rb) catch |err| switch (err) {
+                    decoder.writeFrame(self.rb) catch |e| switch (e) {
                         error.EOF => {
                             decoder.deinitSong();
                             self.client.broadcast_spinning(.song_end);
@@ -270,7 +278,7 @@ pub const Source = struct {
                             continue :loop;
                         },
                         error.WouldBlock => {
-                            std.debug.print("Hit Block\n", .{});
+                            self.logger.log("Hit Block", .{}, .debug);
                             self.client.broadcast_spinning(.high_tide);
                             epoll_wait = -1;
                             continue :loop;

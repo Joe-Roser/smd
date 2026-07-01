@@ -6,40 +6,51 @@ const sink = @import("sink.zig");
 const source = @import("source.zig");
 
 const RB = @import("pw_audio").SPSC_f32;
+const Logger = @import("Logger.zig");
 const Client = event.Client;
 const Epoll = zio.Epoll;
+const Queue = LinkedList([:0]const u8);
 
 const stdin = std.Io.File.stdin();
 
 const AudioState = enum(u8) { paused, playing, eof };
 
 const Main = struct {
-    queue: *Queue,
-    rb: *RB,
     client: *Client,
+    logger: Logger,
+    audio_state: AudioState,
+    queue: *Queue,
+
     source: *source.Source,
     sink: *sink.Sink,
-    audio_state: AudioState,
+    rb: *RB,
 
-    pub fn init(client: *Client, src: *source.Source, snk: *sink.Sink, queue: *Queue, rb: *RB) Main {
+    pub fn init(client: *Client, logger: Logger, src: *source.Source, snk: *sink.Sink, queue: *Queue, rb: *RB) Main {
         return .{
             .client = client,
-            .source = src,
-            .sink = snk,
+            .logger = logger,
             .audio_state = .paused,
             .queue = queue,
+
+            .source = src,
+            .sink = snk,
             .rb = rb,
         };
     }
 
+    pub fn err(self: *Main, erro: anyerror) void {
+        self.logger.log("{any}", .{erro}, .err);
+        self.client.broadcast_spinning(.err_unrecoverable);
+    }
+
     fn run(self: *Main, alloc: std.mem.Allocator) void {
-        var epoll = Epoll.init(.{}) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        var epoll = Epoll.init(.{}) catch |e|
+            return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
-        epoll.add(stdin.handle, Epoll.IN, .{ .u64 = 1 }) catch
-            return self.client.broadcast_spinning(.err_unrecoverable);
+        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+            return self.err(e);
+        epoll.add(stdin.handle, Epoll.IN, .{ .u64 = 1 }) catch |e|
+            return self.err(e);
 
         var events: [4]Epoll.Event = undefined;
 
@@ -47,8 +58,8 @@ const Main = struct {
             const n = epoll.wait(&events, -1) catch
                 continue :loop;
 
-            events: for (events[0..n]) |e|
-                switch (e.data.u64) {
+            events: for (events[0..n]) |ev|
+                switch (ev.data.u64) {
                     0 => {
                         var buf: [8]u8 = undefined;
                         _ = std.os.linux.read(self.client.fd, &buf, buf.len);
@@ -56,13 +67,13 @@ const Main = struct {
                         while (self.client.receive()) |r| {
                             switch (r) {
                                 .quit, .err_unrecoverable => {
-                                    std.debug.print("Received: {}\n", .{r});
+                                    self.logger.log("Received: {}", .{r}, .info);
                                     if (self.source.title) |t| alloc.free(t);
                                     self.source.title = null;
                                     break :loop;
                                 },
                                 .song_end => {
-                                    std.debug.print("Song End\n", .{});
+                                    self.logger.log("Song End", .{}, .debug);
                                     if (self.queue.popFirst()) |song| {
                                         if (self.source.title) |t| alloc.free(t);
                                         self.source.title = song.value;
@@ -75,7 +86,7 @@ const Main = struct {
                                     }
                                 },
                                 .low_tide, .high_tide => {},
-                                .song_path_loaded, .pause, .play => unreachable,
+                                .song_path_loaded, .play, .pause, .sink_pause_ack => unreachable,
                             }
                         }
                     },
@@ -85,19 +96,21 @@ const Main = struct {
 
                         if (std.mem.eql(u8, "q\n", msg[0..m])) {
                             self.client.broadcast_spinning(.quit);
-                            std.debug.print("Quit\n", .{});
+                            self.logger.log("Quit", .{}, .info);
                             if (self.source.title) |t| alloc.free(t);
                             self.source.title = null;
                             break :loop;
                         }
                         if (std.mem.eql(u8, "pause\n", msg[0..m])) {
+                            if (self.audio_state == .eof) continue :events;
+
                             self.audio_state = .paused;
                             self.client.broadcast_spinning(.pause);
                             continue :events;
                         }
                         if (std.mem.eql(u8, "play\n", msg[0..m])) {
                             if (self.audio_state == .eof) {
-                                std.debug.print("Play Failed, EOF\n", .{});
+                                self.logger.log("Play Failed, EOF", .{}, .info);
                                 continue :events;
                             }
 
@@ -107,8 +120,8 @@ const Main = struct {
                         }
                         if (std.mem.startsWith(u8, msg[0..m], "path: ")) {
                             const path = msg[6 .. m - 1];
-                            const path_dupe = alloc.dupeSentinel(u8, path, 0) catch
-                                return self.client.broadcast_spinning(.err_unrecoverable);
+                            const path_dupe = alloc.dupeSentinel(u8, path, 0) catch |e|
+                                return self.err(e);
 
                             if (self.source.title == null) {
                                 self.source.title = path_dupe;
@@ -116,31 +129,12 @@ const Main = struct {
                                 self.client.broadcast_spinning(.song_path_loaded);
                                 self.client.broadcast_spinning(.play);
                             } else {
-                                const node = alloc.create(Queue.Node) catch
-                                    return self.client.broadcast_spinning(.err_unrecoverable);
-                                node.value = path_dupe;
+                                const node = alloc.create(Queue.Node) catch |e|
+                                    return self.err(e);
+                                node.* = .{ .value = path_dupe };
 
                                 self.queue.pushLast(node);
                             }
-                        }
-                        if (std.mem.eql(u8, "clear\n", msg[0..m])) {
-                            self.client.broadcast_spinning(.pause);
-                            self.audio_state = .eof;
-                            if (self.source.title) |t| alloc.free(t);
-                            self.source.title = null;
-
-                            while (self.queue.popFirst()) |node| {
-                                alloc.free(node.value);
-                                alloc.destroy(node);
-                            }
-
-                            var threaded = std.Io.Threaded.init_single_threaded;
-                            threaded.io().sleep(.fromMilliseconds(10), .real) catch {};
-                            // TODO: For this to be safe, we need to receive some kind of ack. figure out how to do this.
-                            self.rb.reset();
-                            std.debug.print("rb_fill: {}\n", .{self.rb.fill()});
-
-                            continue :events;
                         }
                     },
                     else => unreachable,
@@ -149,13 +143,16 @@ const Main = struct {
     }
 };
 
-const Queue = LinkedList([:0]const u8);
-
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const alloc = init.gpa;
 
-    var rb = try @import("pw_audio").SPSC_f32.init(128);
+    const stdout = std.Io.File.stdout();
+    var stdout_w = stdout.writer(io, &.{});
+    var logger: Logger = .init(&stdout_w.interface);
+    logger.log("Initialised Logger", .{}, .debug);
+
+    var rb = try RB.init(128);
     defer rb.deinit();
 
     var queue: Queue = .init;
@@ -176,15 +173,15 @@ pub fn main(init: std.process.Init) !void {
 
     // Setting up threads
 
-    var src: source.Source = .init(&clients[1], &rb);
+    var src: source.Source = .init(&clients[1], logger, &rb);
     var source_handle = try io.concurrent(source.Source.run, .{&src});
     errdefer source_handle.cancel(io);
 
-    var snk: sink.Sink = .init(&clients[2], &rb);
+    var snk: sink.Sink = .init(&clients[2], logger, &rb);
     var sink_handle = try io.concurrent(sink.Sink.run, .{&snk});
     errdefer sink_handle.cancel(io);
 
-    var mn = Main.init(&clients[0], &src, &snk, &queue, &rb);
+    var mn = Main.init(&clients[0], logger, &src, &snk, &queue, &rb);
     mn.run(alloc);
 
     _ = source_handle.await(io);
@@ -212,6 +209,7 @@ fn LinkedList(comptime T: type) type {
         pub fn popFirst(self: *List) ?*Node {
             const ret = self.start orelse return null;
             self.start = ret.next;
+            if (self.start == null) self.end = null;
             return ret;
         }
 
