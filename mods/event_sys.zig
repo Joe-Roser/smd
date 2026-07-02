@@ -2,7 +2,7 @@ const std = @import("std");
 const zio = @import("zio.zig");
 const Io = std.Io;
 
-const eventfd = zio.eventfd;
+const EventFd = zio.EventFd;
 
 pub fn Client(comptime Event: type) type {
     return struct {
@@ -17,7 +17,7 @@ pub fn Client(comptime Event: type) type {
         writer_idx: u32 = 0,
 
         asleep: u32 = 1,
-        fd: std.posix.fd_t = undefined,
+        fd: EventFd = undefined,
 
         lock: std.atomic.Value(u32) = .init(0),
 
@@ -65,7 +65,7 @@ pub fn Client(comptime Event: type) type {
                 client.writer_idx +%= 1;
 
                 if (@atomicLoad(u32, &client.reader_idx, .acquire) == writer_idxs[i] and @atomicLoad(u32, &client.asleep, .monotonic) == 1)
-                    std.os.linux.write(client.fd, &@as(usize, 1), @sizeOf(usize));
+                    client.fd.write() catch {};
             }
         }
 
@@ -92,8 +92,7 @@ pub fn Client(comptime Event: type) type {
                 client.writer_idx +%= 1;
 
                 if (@atomicLoad(u32, &client.reader_idx, .acquire) == writer and @atomicLoad(u32, &client.asleep, .monotonic) == 1) {
-                    const msg: usize = 1;
-                    _ = std.os.linux.write(client.fd, std.mem.asBytes(&msg), @sizeOf(usize));
+                    client.fd.write() catch {};
                 }
             }
         }
@@ -110,9 +109,9 @@ pub fn Client(comptime Event: type) type {
 const E = enum {};
 
 test "setClients Correctness" {
-    var c1: Client(E) = .{ .fd = try eventfd(0, 0) };
-    var c2: Client(E) = .{ .fd = try eventfd(0, 0) };
-    var c3: Client(E) = .{ .fd = try eventfd(0, 0) };
+    var c1: Client(E) = .{ .fd = try .init(0, 0) };
+    var c2: Client(E) = .{ .fd = try .init(0, 0) };
+    var c3: Client(E) = .{ .fd = try .init(0, 0) };
 
     c1.setClients(.{ &c2, &c3 });
     c2.setClients(.{ &c1, &c3 });

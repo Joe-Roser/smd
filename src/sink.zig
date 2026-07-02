@@ -10,20 +10,24 @@ const Epoll = zio.Epoll;
 
 pub const Sink = struct {
     client: *Client,
-    logger: Logger,
+    logger: *Logger,
     rb: *RB,
-    audio: PW = undefined,
+    audio: PW,
     high_tide: bool = false,
     low_tide: u32,
 
-    pub fn init(client: *Client, logger: Logger, rb: *RB) Sink {
+    pub fn init(client: *Client, logger: *Logger, rb: *RB) !Sink {
         const low_tide_percent = 0.2;
         return .{
             .logger = logger,
             .client = client,
             .rb = rb,
+            .audio = undefined,
             .low_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * low_tide_percent),
         };
+    }
+    pub fn deinit(self: *Sink) void {
+        self.audio.deinit();
     }
 
     pub fn err(self: *Sink, erro: anyerror) void {
@@ -32,18 +36,17 @@ pub const Sink = struct {
     }
 
     pub fn run(self: *Sink) void {
-        var audio = PW.init(.{ .channels = 2, .sample_rate = 48000 }, self.rb) catch |e|
+        self.audio = PW.init(.{ .channels = 2, .sample_rate = 48000 }, self.rb) catch |e|
             return self.err(e);
-        defer audio.deinit();
-
-        audio.pause();
+        defer self.audio.deinit();
+        self.audio.pause();
 
         var epoll = Epoll.init(.{}) catch |e|
             return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+        epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
             return self.err(e);
-        epoll.add(audio.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
+        epoll.add(self.audio.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
             return self.err(e);
 
         var events: [8]Epoll.Event = undefined;
@@ -51,27 +54,38 @@ pub const Sink = struct {
             const n = epoll.wait(&events, -1) catch
                 continue :loop;
 
-            for (events[0..n]) |e| {
-                switch (e.data.u64) {
+            for (events[0..n]) |evn| {
+                switch (evn.data.u64) {
                     0 => {
-                        var buf: [8]u8 = undefined;
-                        _ = std.os.linux.read(self.client.fd, &buf, buf.len);
+                        self.client.fd.read() catch {};
 
                         while (self.client.receive()) |r| {
                             switch (r) {
                                 .quit, .err_unrecoverable => break :loop,
+                                .zero => {
+                                    self.audio.zero();
+                                },
+                                .clear => {
+                                    self.audio.pause();
+                                    self.audio.clear();
+                                },
                                 .high_tide => {
                                     self.high_tide = true;
                                 },
-                                .pause => audio.pause(),
-                                .play => audio.play(),
+                                .pause => {
+                                    self.audio.pause();
+                                },
+                                .play => {
+                                    self.logger.log("sink play", .{}, .debug);
+                                    self.audio.play();
+                                },
                                 .song_path_loaded, .song_end => {},
                                 .low_tide => unreachable,
                             }
                         }
                     },
                     1 => {
-                        audio.iterate();
+                        self.audio.iterate();
                         if (self.high_tide and self.rb.fill() <= self.low_tide) {
                             self.client.broadcast_spinning(.low_tide);
                         }

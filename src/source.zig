@@ -94,7 +94,7 @@ const FFState = struct {
 
         self.eof = false;
     }
-    fn deinitSong(self: *FFState) void {
+    pub fn deinitSong(self: *FFState) void {
         if (self.conv_buf) |_| ff.av_freep(@ptrCast(&self.conv_buf.?));
         self.conv_buffer_samples = 0;
 
@@ -202,20 +202,35 @@ const FFState = struct {
 
 pub const Source = struct {
     client: *Client,
-    logger: Logger,
+    logger: *Logger,
+    decoder: FFState,
     rb: *RB,
     title: ?[:0]const u8 = null,
 
     high_tide: u32,
+    eof: bool,
 
-    pub fn init(client: *Client, logger: Logger, rb: *RB) Source {
+    freezefd: zio.EventFd,
+    defrostfd: zio.EventFd,
+
+    pub fn init(client: *Client, logger: *Logger, rb: *RB) !Source {
         const high_tide_percent = 0.9;
         return .{
             .client = client,
             .logger = logger,
+            .decoder = FFState.init() orelse return error.NoFFState,
             .rb = rb,
+
             .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
+            .eof = true,
+
+            .freezefd = try zio.EventFd.init(0, 0),
+            .defrostfd = try zio.EventFd.init(0, 0),
         };
+    }
+    pub fn deinit(self: *Source) void {
+        self.decoder.deinitSong();
+        self.decoder.deinit();
     }
 
     pub fn err(self: *Source, erro: anyerror) void {
@@ -227,13 +242,8 @@ pub const Source = struct {
         var epoll = Epoll.init(.{}) catch |e|
             return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+        epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
             return self.err(e);
-
-        var decoder = FFState.init() orelse
-            return self.err(error.NoFFState);
-        defer decoder.deinit();
-        defer decoder.deinitSong();
 
         var events: [8]Epoll.Event = undefined;
         var epoll_wait: i32 = -1;
@@ -244,24 +254,28 @@ pub const Source = struct {
             for (events[0..n]) |ev|
                 switch (ev.data.u64) {
                     0 => {
-                        var buf: [8]u8 = undefined;
-                        _ = std.os.linux.read(self.client.fd, &buf, buf.len);
+                        self.client.fd.read() catch {};
 
                         while (self.client.receive()) |r| {
                             switch (r) {
                                 .quit, .err_unrecoverable => break :loop,
+                                .clear => {
+                                    self.freezefd.write() catch {};
+                                    self.defrostfd.read() catch {};
+                                },
                                 .song_path_loaded => {
-                                    decoder.initSong(self.title.?.ptr) catch |e|
+                                    self.decoder.initSong(self.title.?.ptr) catch |e|
                                         return self.err(e);
 
                                     self.logger.log("Loaded", .{}, .debug);
+                                    self.eof = false;
                                     epoll_wait = 0;
                                 },
                                 .low_tide => {
-                                    epoll_wait = 0;
+                                    if (!self.eof) epoll_wait = 0;
                                 },
                                 .play, .pause => {},
-                                .high_tide, .song_end => unreachable,
+                                .high_tide, .song_end, .zero => unreachable,
                             }
                         }
                     },
@@ -270,10 +284,11 @@ pub const Source = struct {
 
             if (epoll_wait == 0) {
                 for (0..5) |_| {
-                    decoder.writeFrame(self.rb) catch |e| switch (e) {
+                    self.decoder.writeFrame(self.rb) catch |e| switch (e) {
                         error.EOF => {
-                            decoder.deinitSong();
+                            self.decoder.deinitSong();
                             self.client.broadcast_spinning(.song_end);
+                            self.eof = true;
                             epoll_wait = -1;
                             continue :loop;
                         },

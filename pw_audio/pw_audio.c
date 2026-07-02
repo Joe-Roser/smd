@@ -1,17 +1,12 @@
-#include <poll.h>
-#include <stdlib.h>
-
 #include <pipewire/pipewire.h>
 #include <spa/param/audio/format-utils.h>
+#include <stdbool.h>
+#include <stdio.h>
 #include <time.h>
 
 #include "pw_audio.h"
+#include "pipewire/stream.h"
 
-
-typedef enum {
-    PW_AUDIO_STATE_PLAYING,
-    PW_AUDIO_STATE_PAUSED,
-} pw_audio_state;
 
 struct pw_audio_internals {
     struct pw_main_loop* loop;
@@ -22,18 +17,25 @@ struct pw_audio_internals {
 };
 
 // TODO: Errorchecking
-void on_process(void *userdata)
-{
+void on_process(void *userdata) {
     struct pw_audio_internals *internals = userdata;
     ring_buffer* rb = internals->rb;
 
     struct pw_buffer *b = pw_stream_dequeue_buffer(internals->stream);
     if (!b) return;
 
+
     struct spa_buffer *sb = b->buffer;
 
     float *dst = sb->datas[0].data;
     int size = sb->datas[0].maxsize / sizeof(float);
+
+    if (internals->state == PW_AUDIO_STATE_ZEROED) {
+        memset(dst, 0, sb->datas[0].maxsize);
+        sb->datas[0].chunk->size = sb->datas[0].maxsize;
+        pw_stream_queue_buffer(internals->stream, b);
+        return;
+    }
 
     u32 size_read = ring_read(rb, dst, size);
 
@@ -115,6 +117,10 @@ void pw_audio_deinit(pw_audio_internals* internals) {
     free(internals);
 }
 
+void pw_audio_clear(pw_audio_internals* internals) {
+    pw_stream_flush(internals->stream, false);
+}
+
 // TODO: Errorchecking
 int pw_audio_get_fd(pw_audio_internals* internals) {
     return pw_loop_get_fd(pw_main_loop_get_loop(internals->loop));
@@ -128,16 +134,24 @@ void pw_audio_main_loop_run(pw_audio_internals* internals) {
     pw_main_loop_run(internals->loop);
 }
 
+void pw_audio_zero(pw_audio_internals* internals) {
+    if (!internals || internals->state == PW_AUDIO_STATE_ZEROED) return;
+    if (internals->state == PW_AUDIO_STATE_PLAYING)
+        pw_stream_set_active(internals->stream, true);
+
+    internals->state = PW_AUDIO_STATE_ZEROED;
+}
+void pw_audio_play(pw_audio_internals* internals) {
+    // TODO: State is getting fucked up???
+        pw_stream_set_active(internals->stream, true);
+    if (!internals || internals->state == PW_AUDIO_STATE_PLAYING) return;
+    // if (internals->state == PW_AUDIO_STATE_ZEROED)
+
+    internals->state = PW_AUDIO_STATE_PLAYING;
+}
 void pw_audio_pause(pw_audio_internals* internals) {
     if (!internals || internals->state == PW_AUDIO_STATE_PAUSED) return;
 
     internals->state = PW_AUDIO_STATE_PAUSED;
     pw_stream_set_active(internals->stream, false);
-}
-
-void pw_audio_resume(pw_audio_internals* internals) {
-    if (!internals || internals->state == PW_AUDIO_STATE_PLAYING) return;
-
-    internals->state = PW_AUDIO_STATE_PLAYING;
-    pw_stream_set_active(internals->stream, true);
 }

@@ -17,7 +17,7 @@ const AudioState = enum(u8) { paused, playing, eof };
 
 const Main = struct {
     client: *Client,
-    logger: Logger,
+    logger: *Logger,
     audio_state: AudioState,
     queue: *Queue,
 
@@ -25,11 +25,11 @@ const Main = struct {
     sink: *sink.Sink,
     rb: *RB,
 
-    pub fn init(client: *Client, logger: Logger, src: *source.Source, snk: *sink.Sink, queue: *Queue, rb: *RB) Main {
+    pub fn init(client: *Client, logger: *Logger, src: *source.Source, snk: *sink.Sink, queue: *Queue, rb: *RB) Main {
         return .{
             .client = client,
             .logger = logger,
-            .audio_state = .paused,
+            .audio_state = .eof,
             .queue = queue,
 
             .source = src,
@@ -47,12 +47,12 @@ const Main = struct {
         var epoll = Epoll.init(.{}) catch |e|
             return self.err(e);
         defer epoll.deinit();
-        epoll.add(self.client.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
+        epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
             return self.err(e);
         epoll.add(stdin.handle, Epoll.IN, .{ .u64 = 1 }) catch |e|
             return self.err(e);
 
-        var events: [4]Epoll.Event = undefined;
+        var events: [8]Epoll.Event = undefined;
 
         loop: while (true) {
             const n = epoll.wait(&events, -1) catch
@@ -61,8 +61,7 @@ const Main = struct {
             events: for (events[0..n]) |ev|
                 switch (ev.data.u64) {
                     0 => {
-                        var buf: [8]u8 = undefined;
-                        _ = std.os.linux.read(self.client.fd, &buf, buf.len);
+                        self.client.fd.read() catch {};
 
                         while (self.client.receive()) |r| {
                             switch (r) {
@@ -86,7 +85,7 @@ const Main = struct {
                                     }
                                 },
                                 .low_tide, .high_tide => {},
-                                .song_path_loaded, .play, .pause, .sink_pause_ack => unreachable,
+                                .song_path_loaded, .play, .pause, .clear, .zero => unreachable,
                             }
                         }
                     },
@@ -96,7 +95,6 @@ const Main = struct {
 
                         if (std.mem.eql(u8, "q\n", msg[0..m])) {
                             self.client.broadcast_spinning(.quit);
-                            self.logger.log("Quit", .{}, .info);
                             if (self.source.title) |t| alloc.free(t);
                             self.source.title = null;
                             break :loop;
@@ -135,7 +133,35 @@ const Main = struct {
 
                                 self.queue.pushLast(node);
                             }
+                            continue :events;
                         }
+                        if (std.mem.eql(u8, "clear\n", msg[0..m])) {
+                            self.client.broadcast_spinning(.clear);
+                            self.audio_state = .eof;
+                            while (self.queue.popFirst()) |path| {
+                                alloc.free(path.value);
+                                alloc.destroy(path);
+                            }
+                            self.source.freezefd.read() catch {};
+
+                            // Source
+                            //  clear the song there
+                            //  make sure not decoding
+                            //  clear the ring buffer
+
+                            if (self.source.title) |t| alloc.free(t);
+                            self.source.title = null;
+                            self.source.rb.reset();
+                            self.source.decoder.deinitSong();
+                            self.source.eof = true;
+
+                            self.client.broadcast_spinning(.pause);
+
+                            self.source.defrostfd.write() catch {};
+                            self.logger.log("clear complete", .{}, .debug);
+                            continue :events;
+                        }
+                        self.logger.log("state - fill: {}, title: {?s}, high_tide?: {}", .{ self.rb.fill(), self.source.title, self.sink.high_tide }, .debug);
                     },
                     else => unreachable,
                 };
@@ -166,22 +192,22 @@ pub fn main(init: std.process.Init) !void {
     // Inter thread communications via mpsc channels
 
     var clients: [3]Client = .{ .init, .init, .init };
-    for (&clients) |*c| c.fd = try zio.eventfd(0, 0);
+    for (&clients) |*c| c.fd = try zio.EventFd.init(0, 0);
     clients[0].setClients(.{ &clients[1], &clients[2] });
     clients[1].setClients(.{ &clients[0], &clients[2] });
     clients[2].setClients(.{ &clients[0], &clients[1] });
 
     // Setting up threads
 
-    var src: source.Source = .init(&clients[1], logger, &rb);
+    var src: source.Source = try .init(&clients[1], &logger, &rb);
     var source_handle = try io.concurrent(source.Source.run, .{&src});
     errdefer source_handle.cancel(io);
 
-    var snk: sink.Sink = .init(&clients[2], logger, &rb);
+    var snk: sink.Sink = try .init(&clients[2], &logger, &rb);
     var sink_handle = try io.concurrent(sink.Sink.run, .{&snk});
     errdefer sink_handle.cancel(io);
 
-    var mn = Main.init(&clients[0], logger, &src, &snk, &queue, &rb);
+    var mn = Main.init(&clients[0], &logger, &src, &snk, &queue, &rb);
     mn.run(alloc);
 
     _ = source_handle.await(io);

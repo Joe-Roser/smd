@@ -23,11 +23,18 @@ pub fn deinit(self: *PwAudio) void {
     pw_c.pw_audio_deinit(self._internals);
 }
 
-pub fn pause(self: *PwAudio) void {
-    pw_c.pw_audio_pause(self._internals);
+pub fn clear(self: *PwAudio) void {
+    pw_c.pw_audio_clear(self._internals);
+}
+
+pub fn zero(self: *PwAudio) void {
+    pw_c.pw_audio_zero(self._internals);
 }
 pub fn play(self: *PwAudio) void {
-    pw_c.pw_audio_resume(self._internals);
+    pw_c.pw_audio_play(self._internals);
+}
+pub fn pause(self: *PwAudio) void {
+    pw_c.pw_audio_pause(self._internals);
 }
 
 pub fn getFd(self: *PwAudio) std.posix.fd_t {
