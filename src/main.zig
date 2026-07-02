@@ -125,7 +125,6 @@ const Main = struct {
                                 self.source.title = path_dupe;
                                 self.audio_state = .playing;
                                 self.client.broadcast_spinning(.song_path_loaded);
-                                self.client.broadcast_spinning(.play);
                             } else {
                                 const node = alloc.create(Queue.Node) catch |e|
                                     return self.err(e);
