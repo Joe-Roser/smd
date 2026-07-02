@@ -3,7 +3,7 @@ const zio = @import("zio");
 const event = @import("event.zig");
 
 const Sink = @import("Sink.zig");
-const Source = @import("source.zig");
+const Source = @import("Source.zig");
 
 const RB = @import("pw_audio").SPSC_f32;
 const Logger = @import("Logger.zig");
