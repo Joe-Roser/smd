@@ -36,8 +36,8 @@ pub fn init() ?Decoder {
     };
 }
 pub fn deinit(self: *Decoder) void {
-    ff.av_packet_free(&self.pkt);
-    ff.av_frame_free(&self.frame);
+    ff.av_packet_free(@ptrCast(&self.pkt));
+    ff.av_frame_free(@ptrCast(&self.frame));
 }
 
 /// Convert libav errors to zig errors
@@ -144,12 +144,12 @@ fn receivePacket(self: *Decoder) !void {
     }
 }
 /// Grab next frame, else grab next packet and next frame. If EOF, return so.
-fn receiveFrame(self: *Decoder) !void {
+fn receiveFrame(self: *Decoder) !bool {
     while (true) {
         const rec_frame = ff.avcodec_receive_frame(self.codec_ctx, self.frame);
-        if (rec_frame >= 0) return;
+        if (rec_frame >= 0) return true;
 
-        if (rec_frame == ff.AVERROR_EOF) return error.EOF;
+        if (rec_frame == ff.AVERROR_EOF) return false;
         if (rec_frame != ff.AVERROR(ff.EAGAIN)) try avError(rec_frame);
         // Only EAGAIN left
 
@@ -160,7 +160,7 @@ fn receiveFrame(self: *Decoder) !void {
 /// Writes a single frame from ffmpeg into the ring buffer.
 /// Returns either void (Success), EOF (music file ended) or WouldBlock (failed to write whole frame).
 /// Crashes if no song is initialised, or called after EOF
-pub fn writeFrame(self: *Decoder, rb: *RB) !void {
+pub fn writeFrame(self: *Decoder, rb: *RB) !bool {
     // Try write previous frame data
     if (self.frame_unfinished) {
         const buf: [*]f32 = if (self.needs_resampling)
@@ -181,7 +181,8 @@ pub fn writeFrame(self: *Decoder, rb: *RB) !void {
 
     // workaround to use continue if no frame data is here
     while (true) {
-        try self.receiveFrame();
+        const more_frames = try self.receiveFrame();
+        if (!more_frames) return false;
 
         var w: u32 = undefined;
         var n_floats: u32 = undefined;
@@ -226,4 +227,5 @@ pub fn writeFrame(self: *Decoder, rb: *RB) !void {
         ff.av_frame_unref(self.frame);
         break;
     }
+    return true;
 }

@@ -1,15 +1,11 @@
 const std = @import("std");
-const zio = @import("zio");
 const event = @import("event.zig");
-
-const Sink = @import("Sink.zig");
-const Source = @import("Source.zig");
 
 const Client = event.Client;
 const Logger = @import("Logger.zig");
 const RB = @import("pw_audio").SPSC_f32;
 const Decoder = @import("Decoder.zig");
-const Epoll = zio.Epoll;
+const Epoll = @import("zio").Epoll;
 const stdin = std.Io.File.stdin();
 
 pub const Queue = LinkedList([:0]const u8);
@@ -19,26 +15,23 @@ pub const Control = @This();
 
 client: *Client,
 logger: *Logger,
-queue: *Queue,
 rb: *RB,
-
-sink: *Sink,
+queue: Queue,
 
 decoder: Decoder,
 audio_state: AudioState,
 
 high_tide: u32,
+epoll_wait: i32 = -1,
 
-pub fn init(client: *Client, logger: *Logger, snk: *Sink, queue: *Queue, rb: *RB) ?Control {
+pub fn init(client: *Client, logger: *Logger, rb: *RB) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
         .client = client,
         .logger = logger,
-        .queue = queue,
         .rb = rb,
-
-        .sink = snk,
+        .queue = .init,
 
         .decoder = Decoder.init() orelse return null,
         .audio_state = .eof,
@@ -46,9 +39,14 @@ pub fn init(client: *Client, logger: *Logger, snk: *Sink, queue: *Queue, rb: *RB
         .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
     };
 }
-pub fn deinit(self: Control) void {
+pub fn deinit(self: *Control, alloc: std.mem.Allocator) void {
     self.decoder.deinitSong();
     self.decoder.deinit();
+
+    while (self.queue.popFirst()) |n| {
+        alloc.free(n.value);
+        alloc.destroy(n);
+    }
 }
 
 pub fn err(self: *Control, erro: anyerror) void {
@@ -68,9 +66,8 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
 
     var events: [8]Epoll.Event = undefined;
 
-    var epoll_wait: i32 = -1;
     loop: while (true) {
-        const n = epoll.wait(&events, epoll_wait) catch
+        const n = epoll.wait(&events, self.epoll_wait) catch
             continue :loop;
 
         events: for (events[0..n]) |ev|
@@ -91,7 +88,7 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                                 break :loop;
                             },
                             .low_tide => {
-                                if (self.audio_state != .eof) epoll_wait = 0;
+                                if (self.audio_state != .eof) self.epoll_wait = 0;
                             },
                             .high_tide, .play, .pause, .clear, .zero, .quit => unreachable,
                         }
@@ -154,13 +151,13 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
 
                             self.client.broadcast_spinning(.play);
                             self.audio_state = .playing;
-                            epoll_wait = 0;
+                            self.epoll_wait = 0;
                         }
                         continue :events;
                     }
                     if (std.mem.eql(u8, "clear\n", msg[0..m])) {
                         self.client.broadcast_spinning(.clear);
-                        epoll_wait = -1;
+                        self.epoll_wait = -1;
                         self.audio_state = .eof;
                         while (self.queue.popFirst()) |path| {
                             alloc.free(path.value);
@@ -174,35 +171,53 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         self.logger.log("clear complete", .{}, .debug);
                         continue :events;
                     }
-                    self.logger.log(
-                        "state - fill: {}, queue: {any}, high_tide?: {}",
-                        .{ self.rb.fill(), self.queue, self.sink.high_tide },
-                        .debug,
-                    );
                 },
                 else => unreachable,
             };
 
-        if (epoll_wait == 0) {
+        if (self.epoll_wait == 0) {
             for (0..5) |_| {
-                self.decoder.writeFrame(self.rb) catch |e| switch (e) {
-                    error.EOF => {
-                        self.decoder.deinitSong();
-                        self.audio_state = .eof;
-                        epoll_wait = -1;
-                        continue :loop;
-                    },
+                const success = self.decoder.writeFrame(self.rb) catch |write_ret| switch (write_ret) {
                     error.WouldBlock => {
                         self.logger.log("Hit Block", .{}, .debug);
                         self.client.broadcast_spinning(.high_tide);
-                        epoll_wait = -1;
+                        self.epoll_wait = -1;
                         continue :loop;
                     },
-                    else => self.err(e),
+                    else => return self.err(write_ret),
                 };
+                if (!success) {
+                    // Song hit eof
+                    self.decoder.deinitSong();
+
+                    const ended = self.queue.popFirst().?;
+                    alloc.free(ended.value);
+                    alloc.destroy(ended);
+
+                    load: while (self.queue.start) |path| {
+                        // Try load next song
+                        self.decoder.initSong(path.value) catch |e|
+                            switch (e) {
+                                error.AV_NOENT => {
+                                    self.logger.log("Song not found: {s}", .{path.value}, .info);
+                                    alloc.free(path.value);
+                                    alloc.destroy(path);
+                                    _ = self.queue.popFirst();
+                                    continue :load;
+                                },
+                                else => return self.err(e),
+                            };
+                        continue :loop;
+                    }
+
+                    // if no song in queue
+                    self.audio_state = .eof;
+                    self.epoll_wait = -1;
+                    continue :loop;
+                }
                 if (self.rb.fill() >= self.high_tide) {
                     self.client.broadcast_spinning(.high_tide);
-                    epoll_wait = -1;
+                    self.epoll_wait = -1;
                     continue :loop;
                 }
             }

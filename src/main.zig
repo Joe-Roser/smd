@@ -26,14 +26,6 @@ pub fn main(init: std.process.Init) !void {
     var rb = try RB.init(128);
     defer rb.deinit();
 
-    var queue: Queue = .init;
-    defer {
-        while (queue.popFirst()) |n| {
-            alloc.free(n.value);
-            alloc.destroy(n);
-        }
-    }
-
     // Inter thread communications via mpsc channels
 
     var ctrl_client: Client = .{ .client = undefined, .fd = try .init(1, 0) };
@@ -46,7 +38,8 @@ pub fn main(init: std.process.Init) !void {
     var sink_handle = try io.concurrent(Sink.run, .{&sink});
     errdefer sink_handle.cancel(io);
 
-    var ctrl = Control.init(&ctrl_client, &logger, &sink, &queue, &rb) orelse return error.NoCtrl;
+    var ctrl = Control.init(&ctrl_client, &logger, &rb) orelse return error.NoCtrl;
+    defer ctrl.deinit(alloc);
     ctrl.run(alloc);
 
     _ = sink_handle.await(io);
