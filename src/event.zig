@@ -11,10 +11,8 @@ pub const Event = enum(u8) {
     zero,
     play,
     pause,
-    song_end,
-    song_path_loaded,
 
     clear,
 };
 
-pub const Client = event_sys.Client(Event);
+pub const Client = event_sys.SPSCClient(Event, 128);

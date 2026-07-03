@@ -5,38 +5,50 @@ const event = @import("event.zig");
 const Sink = @import("Sink.zig");
 const Source = @import("Source.zig");
 
-const RB = @import("pw_audio").SPSC_f32;
-const Logger = @import("Logger.zig");
 const Client = event.Client;
+const Logger = @import("Logger.zig");
+const RB = @import("pw_audio").SPSC_f32;
+const Decoder = @import("Decoder.zig");
 const Epoll = zio.Epoll;
-pub const Queue = LinkedList([:0]const u8);
-
 const stdin = std.Io.File.stdin();
 
+pub const Queue = LinkedList([:0]const u8);
 const AudioState = enum(u8) { paused, playing, eof };
 
 pub const Control = @This();
 
 client: *Client,
 logger: *Logger,
-audio_state: AudioState,
 queue: *Queue,
-
-source: *Source,
-sink: *Sink,
 rb: *RB,
 
-pub fn init(client: *Client, logger: *Logger, src: *Source, snk: *Sink, queue: *Queue, rb: *RB) Control {
+sink: *Sink,
+
+decoder: Decoder,
+audio_state: AudioState,
+
+high_tide: u32,
+
+pub fn init(client: *Client, logger: *Logger, snk: *Sink, queue: *Queue, rb: *RB) ?Control {
+    const high_tide_percent = 0.9;
+
     return .{
         .client = client,
         .logger = logger,
-        .audio_state = .eof,
         .queue = queue,
-
-        .source = src,
-        .sink = snk,
         .rb = rb,
+
+        .sink = snk,
+
+        .decoder = Decoder.init() orelse return null,
+        .audio_state = .eof,
+
+        .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
     };
+}
+pub fn deinit(self: Control) void {
+    self.decoder.deinitSong();
+    self.decoder.deinit();
 }
 
 pub fn err(self: *Control, erro: anyerror) void {
@@ -48,6 +60,7 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
     var epoll = Epoll.init(.{}) catch |e|
         return self.err(e);
     defer epoll.deinit();
+
     epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
         return self.err(e);
     epoll.add(stdin.handle, Epoll.IN, .{ .u64 = 1 }) catch |e|
@@ -55,38 +68,33 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
 
     var events: [8]Epoll.Event = undefined;
 
+    var epoll_wait: i32 = -1;
     loop: while (true) {
-        const n = epoll.wait(&events, -1) catch
+        const n = epoll.wait(&events, epoll_wait) catch
             continue :loop;
+        std.debug.print("ctrl\n", .{});
 
         events: for (events[0..n]) |ev|
             switch (ev.data.u64) {
                 0 => {
                     self.client.fd.read() catch {};
+                    self.client.sleep();
 
                     while (self.client.receive()) |r| {
                         switch (r) {
-                            .quit, .err_unrecoverable => {
+                            .err_unrecoverable => {
                                 self.logger.log("Received: {}", .{r}, .info);
-                                if (self.source.title) |t| alloc.free(t);
-                                self.source.title = null;
+                                while (self.queue.popFirst()) |path| {
+                                    alloc.free(path.value);
+                                    alloc.destroy(path);
+                                }
+
                                 break :loop;
                             },
-                            .song_end => {
-                                self.logger.log("Song End", .{}, .debug);
-                                if (self.queue.popFirst()) |song| {
-                                    if (self.source.title) |t| alloc.free(t);
-                                    self.source.title = song.value;
-                                    alloc.destroy(song);
-
-                                    self.client.broadcast_spinning(.song_path_loaded);
-                                } else {
-                                    self.audio_state = .paused;
-                                    self.client.broadcast_spinning(.pause);
-                                }
+                            .low_tide => {
+                                if (self.audio_state != .eof) epoll_wait = 0;
                             },
-                            .low_tide, .high_tide => {},
-                            .song_path_loaded, .play, .pause, .clear, .zero => unreachable,
+                            .high_tide, .play, .pause, .clear, .zero, .quit => unreachable,
                         }
                     }
                 },
@@ -96,8 +104,10 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
 
                     if (std.mem.eql(u8, "q\n", msg[0..m])) {
                         self.client.broadcast_spinning(.quit);
-                        if (self.source.title) |t| alloc.free(t);
-                        self.source.title = null;
+                        while (self.queue.popFirst()) |path| {
+                            alloc.free(path.value);
+                            alloc.destroy(path);
+                        }
                         break :loop;
                     }
                     if (std.mem.eql(u8, "pause\n", msg[0..m])) {
@@ -118,53 +128,86 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         continue :events;
                     }
                     if (std.mem.startsWith(u8, msg[0..m], "path: ")) {
+                        // TODO:Check the path
                         const path = msg[6 .. m - 1];
                         const path_dupe = alloc.dupeSentinel(u8, path, 0) catch |e|
                             return self.err(e);
 
-                        if (self.source.title == null) {
-                            self.source.title = path_dupe;
-                            self.audio_state = .playing;
-                            self.client.broadcast_spinning(.song_path_loaded);
-                        } else {
-                            const node = alloc.create(Queue.Node) catch |e|
-                                return self.err(e);
-                            node.* = .{ .value = path_dupe };
+                        const node = alloc.create(Queue.Node) catch |e|
+                            return self.err(e);
+                        node.* = .{ .value = path_dupe };
 
-                            self.queue.pushLast(node);
+                        const first_item = self.queue.start;
+                        self.queue.pushLast(node);
+
+                        // If this is the first song in the queue, play it
+                        if (first_item == null) {
+                            self.decoder.initSong(self.queue.start.?.value) catch |e|
+                                switch (e) {
+                                    error.AV_NOENT => {
+                                        self.logger.log("Song not found", .{}, .info);
+                                        continue :events;
+                                    },
+                                    else => self.err(e),
+                                };
+                            self.logger.log("Loaded", .{}, .debug);
+                            // eof was already set
+
+                            self.client.broadcast_spinning(.play);
+                            self.audio_state = .playing;
+                            epoll_wait = 0;
                         }
                         continue :events;
                     }
                     if (std.mem.eql(u8, "clear\n", msg[0..m])) {
                         self.client.broadcast_spinning(.clear);
+                        epoll_wait = -1;
                         self.audio_state = .eof;
                         while (self.queue.popFirst()) |path| {
                             alloc.free(path.value);
                             alloc.destroy(path);
                         }
-                        self.source.freezefd.read() catch {};
-
-                        // Source
-                        //  clear the song there
-                        //  make sure not decoding
-                        //  clear the ring buffer
-
-                        if (self.source.title) |t| alloc.free(t);
-                        self.source.title = null;
-                        self.source.rb.reset();
-                        self.source.decoder.deinitSong();
-                        self.source.eof = true;
+                        self.rb.reset();
+                        self.decoder.deinitSong();
 
                         self.client.broadcast_spinning(.pause);
 
-                        self.source.defrostfd.write() catch {};
                         self.logger.log("clear complete", .{}, .debug);
                         continue :events;
                     }
-                    self.logger.log("state - fill: {}, title: {?s}, high_tide?: {}", .{ self.rb.fill(), self.source.title, self.sink.high_tide }, .debug);
+                    self.logger.log(
+                        "state - fill: {}, queue: {any}, high_tide?: {}",
+                        .{ self.rb.fill(), self.queue, self.sink.high_tide },
+                        .debug,
+                    );
                 },
                 else => unreachable,
             };
+
+        if (epoll_wait == 0) {
+            for (0..5) |_| {
+                self.decoder.writeFrame(self.rb) catch |e| switch (e) {
+                    error.EOF => {
+                        self.decoder.deinitSong();
+                        self.audio_state = .eof;
+                        epoll_wait = -1;
+                        continue :loop;
+                    },
+                    error.WouldBlock => {
+                        self.logger.log("Hit Block", .{}, .debug);
+                        self.client.broadcast_spinning(.high_tide);
+                        epoll_wait = -1;
+                        continue :loop;
+                    },
+                    else => self.err(e),
+                };
+                if (self.rb.fill() >= self.high_tide) {
+                    self.client.broadcast_spinning(.high_tide);
+                    epoll_wait = -1;
+                    continue :loop;
+                }
+            }
+        }
     }
 }
 

@@ -4,12 +4,10 @@ const event = @import("event.zig");
 
 const Control = @import("Control.zig");
 const Sink = @import("Sink.zig");
-const Source = @import("Source.zig");
 
 const RB = @import("pw_audio").SPSC_f32;
 const Logger = @import("Logger.zig");
 const Client = event.Client;
-const Epoll = zio.Epoll;
 const Queue = Control.Queue;
 
 const stdin = std.Io.File.stdin();
@@ -38,25 +36,18 @@ pub fn main(init: std.process.Init) !void {
 
     // Inter thread communications via mpsc channels
 
-    var clients: [3]Client = .{ .init, .init, .init };
-    for (&clients) |*c| c.fd = try zio.EventFd.init(0, 0);
-    clients[0].setClients(.{ &clients[1], &clients[2] });
-    clients[1].setClients(.{ &clients[0], &clients[2] });
-    clients[2].setClients(.{ &clients[0], &clients[1] });
+    var ctrl_client: Client = .{ .client = undefined, .fd = try .init(1, 0) };
+    var sink_client: Client = .{ .client = &ctrl_client, .fd = try .init(1, 0) };
+    ctrl_client.client = &sink_client;
 
     // Setting up threads
 
-    var src: Source = try .init(&clients[1], &logger, &rb);
-    var source_handle = try io.concurrent(Source.run, .{&src});
-    errdefer source_handle.cancel(io);
-
-    var snk: Sink = try .init(&clients[2], &logger, &rb);
-    var sink_handle = try io.concurrent(Sink.run, .{&snk});
+    var sink: Sink = try .init(&sink_client, &logger, &rb);
+    var sink_handle = try io.concurrent(Sink.run, .{&sink});
     errdefer sink_handle.cancel(io);
 
-    var mn = Control.init(&clients[0], &logger, &src, &snk, &queue, &rb);
-    mn.run(alloc);
+    var ctrl = Control.init(&ctrl_client, &logger, &sink, &queue, &rb) orelse return error.NoCtrl;
+    ctrl.run(alloc);
 
-    _ = source_handle.await(io);
     _ = sink_handle.await(io);
 }

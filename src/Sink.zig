@@ -54,11 +54,14 @@ pub fn run(self: *Sink) void {
     loop: while (true) {
         const n = epoll.wait(&events, -1) catch
             continue :loop;
+        std.debug.print("sink\n", .{});
 
         for (events[0..n]) |evn| {
+            std.debug.print("{}\n", .{evn.data.u64});
             switch (evn.data.u64) {
                 0 => {
                     self.client.fd.read() catch {};
+                    self.client.sleep();
 
                     while (self.client.receive()) |r| {
                         switch (r) {
@@ -77,10 +80,8 @@ pub fn run(self: *Sink) void {
                                 self.audio.pause();
                             },
                             .play => {
-                                self.logger.log("sink play", .{}, .debug);
                                 self.audio.play();
                             },
-                            .song_path_loaded, .song_end => {},
                             .low_tide => unreachable,
                         }
                     }
@@ -96,4 +97,3 @@ pub fn run(self: *Sink) void {
         }
     }
 }
-

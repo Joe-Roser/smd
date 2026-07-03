@@ -1,2 +1,2 @@
-Improve ffmpeg error handling
-Improve clear handling (source clears rb, sink pauses)
+
+Why is it spinnig??
