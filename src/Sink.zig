@@ -54,10 +54,8 @@ pub fn run(self: *Sink) void {
     loop: while (true) {
         const n = epoll.wait(&events, -1) catch
             continue :loop;
-        std.debug.print("sink\n", .{});
 
         for (events[0..n]) |evn| {
-            std.debug.print("{}\n", .{evn.data.u64});
             switch (evn.data.u64) {
                 0 => {
                     self.client.fd.read() catch {};

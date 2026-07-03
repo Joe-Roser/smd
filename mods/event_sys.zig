@@ -34,9 +34,7 @@ pub fn SPSCClient(comptime Event: type, comptime cap: u32) type {
 
         pub fn broadcast_spinning(self: *Self, event: Event) void {
             const writer = self.client.writer_idx;
-            while (writer -% self.client.reader_idx >= capacity) {
-                std.debug.print(".", .{});
-            }
+            while (writer -% self.client.reader_idx >= capacity) {}
 
             self.client.events[writer & mask] = event;
             self.client.writer_idx +%= 1;
@@ -50,6 +48,7 @@ pub fn SPSCClient(comptime Event: type, comptime cap: u32) type {
             if (self.reader_idx == @atomicLoad(u32, &self.writer_idx, .acquire)) return null;
 
             const ret = self.events[self.reader_idx & mask];
+            _ = @atomicRmw(u32, &self.reader_idx, .Add, 1, .release);
             return ret;
         }
 

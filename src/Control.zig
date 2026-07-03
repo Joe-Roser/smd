@@ -72,7 +72,6 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
     loop: while (true) {
         const n = epoll.wait(&events, epoll_wait) catch
             continue :loop;
-        std.debug.print("ctrl\n", .{});
 
         events: for (events[0..n]) |ev|
             switch (ev.data.u64) {
