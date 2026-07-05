@@ -30,8 +30,11 @@ pub fn init(w: *std.Io.Writer) Logger {
 pub fn log(self: *Logger, comptime msg: []const u8, args: anytype, comptime level: Level) void {
     if (@intFromEnum(level) < @intFromEnum(builtin_level)) return;
     var lock = @atomicRmw(u32, &self.lock, .Add, 1, .acq_rel);
-    while (lock != 0) {
+    if (lock != 0) {
         lock = @atomicLoad(u32, &self.lock, .acquire);
+        while (lock != 1) {
+            lock = @atomicLoad(u32, &self.lock, .acquire);
+        }
     }
 
     self.writer.print(level.toString() ++ msg ++ "\n", args) catch
