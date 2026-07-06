@@ -21,7 +21,6 @@ pub fn main(init: std.process.Init) !void {
     const stdout = std.Io.File.stdout();
     var stdout_w = stdout.writer(io, &.{});
     var logger: Logger = .init(&stdout_w.interface);
-    logger.log("Initialised Logger", .{}, .debug);
 
     var rb = try RB.init(128);
     defer rb.deinit();
@@ -38,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     var sink_handle = try io.concurrent(Sink.run, .{&sink});
     errdefer sink_handle.cancel(io);
 
-    var ctrl = Control.init(&ctrl_client, &logger, &rb) orelse return error.NoCtrl;
+    var ctrl = Control.init(&ctrl_client, &logger, &rb, sink.ack_fd) orelse return error.NoCtrl;
     defer ctrl.deinit(alloc);
     ctrl.run(alloc);
 

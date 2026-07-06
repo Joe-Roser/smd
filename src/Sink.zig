@@ -14,8 +14,10 @@ client: *Client,
 logger: *Logger,
 rb: *RB,
 audio: PW,
-high_tide: bool = false,
+high_tide: bool,
 low_tide: u32,
+
+ack_fd: zio.EventFd,
 
 pub fn init(client: *Client, logger: *Logger, rb: *RB) !Sink {
     const low_tide_percent = 0.2;
@@ -24,7 +26,9 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB) !Sink {
         .client = client,
         .rb = rb,
         .audio = undefined,
+        .high_tide = false,
         .low_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * low_tide_percent),
+        .ack_fd = try .init(0, 0),
     };
 }
 pub fn deinit(self: *Sink) void {
@@ -70,6 +74,14 @@ pub fn run(self: *Sink) void {
                             .clear => {
                                 self.audio.pause();
                                 self.audio.clear();
+                                while (true) {
+                                    self.ack_fd.write() catch {
+                                        self.logger.log("ack write failed", .{}, .debug);
+                                        continue;
+                                    };
+                                    break;
+                                }
+                                self.logger.log("sink cleared", .{}, .debug);
                             },
                             .high_tide => {
                                 self.high_tide = true;
@@ -88,6 +100,7 @@ pub fn run(self: *Sink) void {
                     self.audio.iterate();
                     if (self.high_tide and self.rb.fill() <= self.low_tide) {
                         self.client.broadcast_spinning(.low_tide);
+                        self.high_tide = false;
                     }
                 },
                 else => unreachable,

@@ -1,5 +1,6 @@
 const std = @import("std");
 const event = @import("event.zig");
+const zio = @import("zio");
 
 const Client = event.Client;
 const Logger = @import("Logger.zig");
@@ -22,9 +23,11 @@ decoder: Decoder,
 audio_state: AudioState,
 
 high_tide: u32,
-epoll_wait: i32 = -1,
+epoll_wait: i32,
 
-pub fn init(client: *Client, logger: *Logger, rb: *RB) ?Control {
+ack_fd: zio.EventFd,
+
+pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: zio.EventFd) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
@@ -37,6 +40,9 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB) ?Control {
         .audio_state = .eof,
 
         .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
+        .epoll_wait = -1,
+
+        .ack_fd = ack_fd,
     };
 }
 pub fn deinit(self: *Control, alloc: std.mem.Allocator) void {
@@ -52,6 +58,26 @@ pub fn deinit(self: *Control, alloc: std.mem.Allocator) void {
 pub fn err(self: *Control, erro: anyerror) void {
     self.logger.log("{any}", .{erro}, .err);
     self.client.broadcast_spinning(.err_unrecoverable);
+}
+
+/// Initialise the next song in the decoder, repeating untill a song is loaded successfully.
+/// returns true when song is loaded, and false if song path is bad.
+pub fn initSong(self: *Control, alloc: std.mem.Allocator) !bool {
+    load: while (self.queue.start) |path| {
+        // Try load next song
+        self.decoder.initSong(path.value) catch |e| switch (e) {
+            error.AV_NOENT => {
+                self.logger.log("Song not found: {s}", .{path.value}, .info);
+                alloc.free(path.value);
+                alloc.destroy(path);
+                _ = self.queue.popFirst();
+                continue :load;
+            },
+            else => return e,
+        };
+        return true;
+    }
+    return false;
 }
 
 pub fn run(self: *Control, alloc: std.mem.Allocator) void {
@@ -163,13 +189,33 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                             alloc.free(path.value);
                             alloc.destroy(path);
                         }
-                        self.rb.reset();
                         self.decoder.deinitSong();
 
-                        self.client.broadcast_spinning(.pause);
-
-                        self.logger.log("clear complete", .{}, .debug);
+                        self.ack_fd.read() catch |e|
+                            return self.err(e);
+                        self.rb.reset();
                         continue :events;
+                    }
+                    if (std.mem.eql(u8, "next\n", msg[0..m])) {
+                        if (self.audio_state != .playing) continue :events;
+
+                        self.client.broadcast_spinning(.clear);
+                        self.decoder.deinitSong();
+
+                        const path = self.queue.popFirst().?;
+                        alloc.free(path.value);
+                        alloc.destroy(path);
+
+                        self.ack_fd.read() catch |e|
+                            return self.err(e);
+                        self.rb.reset();
+
+                        if (!(self.initSong(alloc) catch unreachable)) {
+                            self.logger.log("Unable to load another song", .{}, .info);
+                            // if no song in queue or all bad paths
+                            self.audio_state = .eof;
+                            self.epoll_wait = -1;
+                        } else self.client.broadcast_spinning(.play);
                     }
                 },
                 else => unreachable,
@@ -194,25 +240,11 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                     alloc.free(ended.value);
                     alloc.destroy(ended);
 
-                    load: while (self.queue.start) |path| {
-                        // Try load next song
-                        self.decoder.initSong(path.value) catch |e|
-                            switch (e) {
-                                error.AV_NOENT => {
-                                    self.logger.log("Song not found: {s}", .{path.value}, .info);
-                                    alloc.free(path.value);
-                                    alloc.destroy(path);
-                                    _ = self.queue.popFirst();
-                                    continue :load;
-                                },
-                                else => return self.err(e),
-                            };
-                        continue :loop;
+                    if (!(self.initSong(alloc) catch unreachable)) {
+                        // if no song in queue or all bad paths
+                        self.audio_state = .eof;
+                        self.epoll_wait = -1;
                     }
-
-                    // if no song in queue
-                    self.audio_state = .eof;
-                    self.epoll_wait = -1;
                     continue :loop;
                 }
                 if (self.rb.fill() >= self.high_tide) {
