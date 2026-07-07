@@ -19,6 +19,8 @@ conv_buffer_samples: i32 = 0,
 pkt: *ff.AVPacket,
 frame: *ff.AVFrame,
 
+pts: i64 = -1,
+
 frame_unfinished: bool = false,
 frame_offset: u32 = 0,
 frame_len: u32 = 0,
@@ -110,6 +112,8 @@ pub fn initSong(self: *Decoder, song_path: [*:0]const u8) !void {
         try avError(ff.swr_init(self.swr));
     }
     errdefer if (self.swr) |_| ff.swr_free(&self.swr);
+
+    self.pts = 0;
 }
 pub fn deinitSong(self: *Decoder) void {
     if (self.conv_buf) |_| ff.av_freep(@ptrCast(&self.conv_buf.?));
@@ -125,6 +129,9 @@ pub fn deinitSong(self: *Decoder) void {
     self.frame_unfinished = false;
     self.frame_len = 0;
     self.frame_offset = 0;
+
+    self.stream_idx = -1;
+    self.pts = ff.AV_NOPTS_VALUE;
 }
 
 /// Loads a new frame.
@@ -183,6 +190,7 @@ pub fn writeFrame(self: *Decoder, rb: *RB) !bool {
     while (true) {
         const more_frames = try self.receiveFrame();
         if (!more_frames) return false;
+        self.pts = self.frame.pts;
 
         var w: u32 = undefined;
         var n_floats: u32 = undefined;
@@ -228,4 +236,44 @@ pub fn writeFrame(self: *Decoder, rb: *RB) !bool {
         break;
     }
     return true;
+}
+
+pub inline fn getTimeBase(self: *Decoder) ?ff.AVRational {
+    if (self.fmt_ctx == null) return null;
+
+    const stream = self.fmt_ctx.?.streams[@intCast(self.stream_idx)];
+    return stream.*.time_base;
+}
+pub inline fn secondsToTimestamp(self: *Decoder, t: i64) ?i64 {
+    return ff.av_rescale_q(
+        t,
+        .{ .num = 1, .den = 1 },
+        self.getTimeBase() orelse return null,
+    );
+}
+pub fn seekTo(self: *Decoder, t: i64) !void {
+    if (self.fmt_ctx == null or self.codec_ctx == null) return error.NoSongLoaded;
+
+    try avError(ff.av_seek_frame(
+        self.fmt_ctx,
+        self.stream_idx,
+        t,
+        ff.AVSEEK_FLAG_BACKWARD,
+    ));
+
+    { // flush
+        ff.avcodec_flush_buffers(self.codec_ctx);
+        if (self.swr) |swr| _ = ff.swr_init(swr);
+
+        ff.av_packet_unref(self.pkt);
+        ff.av_frame_unref(self.frame);
+
+        self.frame_unfinished = false;
+        self.frame_offset = 0;
+        self.frame_len = 0;
+
+        self.pts = t;
+    }
+
+    self.pts = t;
 }

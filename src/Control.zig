@@ -124,7 +124,8 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                     var msg: [1024]u8 = undefined;
                     const m = std.os.linux.read(stdin.handle, &msg, msg.len);
 
-                    if (std.mem.eql(u8, "q\n", msg[0..m])) {
+                    // quit
+                    if (std.mem.eql(u8, "q", msg[0 .. m - 1])) {
                         self.client.broadcast_spinning(.quit);
                         while (self.queue.popFirst()) |path| {
                             alloc.free(path.value);
@@ -132,14 +133,16 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         }
                         break :loop;
                     }
-                    if (std.mem.eql(u8, "pause\n", msg[0..m])) {
+                    // pause
+                    if (std.mem.eql(u8, "pause", msg[0 .. m - 1])) {
                         if (self.audio_state == .eof) continue :events;
 
                         self.audio_state = .paused;
                         self.client.broadcast_spinning(.pause);
                         continue :events;
                     }
-                    if (std.mem.eql(u8, "play\n", msg[0..m])) {
+                    // play
+                    if (std.mem.eql(u8, "play", msg[0 .. m - 1])) {
                         if (self.audio_state == .eof) {
                             self.logger.log("Play Failed, EOF", .{}, .info);
                             continue :events;
@@ -149,7 +152,8 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         self.client.broadcast_spinning(.play);
                         continue :events;
                     }
-                    if (std.mem.startsWith(u8, msg[0..m], "path: ")) {
+                    // path
+                    if (std.mem.startsWith(u8, msg[0 .. m - 1], "path: ")) {
                         // TODO:Check the path
                         const path = msg[6 .. m - 1];
                         const path_dupe = alloc.dupeSentinel(u8, path, 0) catch |e|
@@ -181,7 +185,8 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         }
                         continue :events;
                     }
-                    if (std.mem.eql(u8, "clear\n", msg[0..m])) {
+                    // clear
+                    if (std.mem.eql(u8, "clear", msg[0 .. m - 1])) {
                         self.client.broadcast_spinning(.clear);
                         self.epoll_wait = -1;
                         self.audio_state = .eof;
@@ -196,8 +201,12 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                         self.rb.reset();
                         continue :events;
                     }
-                    if (std.mem.eql(u8, "next\n", msg[0..m])) {
-                        if (self.audio_state != .playing) continue :events;
+                    // next
+                    if (std.mem.eql(u8, "next", msg[0 .. m - 1])) {
+                        if (self.audio_state == .eof) {
+                            self.logger.log("No queued songs", .{}, .info);
+                            continue :events;
+                        }
 
                         self.client.broadcast_spinning(.clear);
                         self.decoder.deinitSong();
@@ -210,12 +219,43 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                             return self.err(e);
                         self.rb.reset();
 
-                        if (!(self.initSong(alloc) catch unreachable)) {
+                        if (!(self.initSong(alloc) catch |e|
+                            return self.err(e)))
+                        {
                             self.logger.log("Unable to load another song", .{}, .info);
                             // if no song in queue or all bad paths
                             self.audio_state = .eof;
                             self.epoll_wait = -1;
-                        } else self.client.broadcast_spinning(.play);
+                        } else if (self.audio_state == .playing) self.client.broadcast_spinning(.play);
+
+                        continue :events;
+                    }
+                    // seek
+                    if (std.mem.startsWith(u8, msg[0 .. m - 1], "seek ") and m == 7) {
+                        const op = if (msg[5] == '+') true else if (msg[5] == '-') false else {
+                            self.logger.log("Usage: 'seek +' or 'seek -'", .{}, .info);
+                            continue :events;
+                        };
+
+                        if (self.audio_state == .eof)
+                            self.logger.log("No song to seek in", .{}, .info);
+
+                        self.client.broadcast_spinning(.clear);
+
+                        const now = self.decoder.pts;
+                        const seek_by = self.decoder.secondsToTimestamp(5) orelse unreachable;
+
+                        const end = if (op) now + seek_by else now - seek_by;
+
+                        self.decoder.seekTo(end) catch |e|
+                            return self.err(e);
+
+                        self.ack_fd.read() catch |e|
+                            return self.err(e);
+                        self.rb.reset();
+
+                        self.client.broadcast_spinning(.play);
+                        continue :events;
                     }
                 },
                 else => unreachable,
@@ -240,7 +280,9 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
                     alloc.free(ended.value);
                     alloc.destroy(ended);
 
-                    if (!(self.initSong(alloc) catch unreachable)) {
+                    if (!(self.initSong(alloc) catch |e|
+                        return self.err(e)))
+                    {
                         // if no song in queue or all bad paths
                         self.audio_state = .eof;
                         self.epoll_wait = -1;
