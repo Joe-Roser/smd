@@ -1,12 +1,12 @@
 const std = @import("std");
 const event = @import("event.zig");
-const zio = @import("zio");
 
 const Client = event.Client;
 const Logger = @import("Logger.zig");
-const RB = @import("pw_audio").SPSC_f32;
+const RB = @import("Audio").RB;
 const Decoder = @import("Decoder.zig");
-const Epoll = @import("zio").Epoll;
+const Epoll = @import("zio/Epoll.zig");
+const EventFd = @import("zio/Eventfd.zig");
 const stdin = std.Io.File.stdin();
 
 pub const Queue = LinkedList([:0]const u8);
@@ -25,9 +25,9 @@ audio_state: AudioState,
 high_tide: u32,
 epoll_wait: i32,
 
-ack_fd: zio.EventFd,
+ack_fd: EventFd,
 
-pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: zio.EventFd) ?Control {
+pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
@@ -39,7 +39,7 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: zio.EventFd) ?Con
         .decoder = Decoder.init() orelse return null,
         .audio_state = .eof,
 
-        .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * high_tide_percent),
+        .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb.capacity)) * high_tide_percent),
         .epoll_wait = -1,
 
         .ack_fd = ack_fd,

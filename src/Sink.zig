@@ -1,23 +1,23 @@
 const std = @import("std");
-const PW = @import("pw_audio");
-const zio = @import("zio");
+const Audio = @import("Audio");
 const event = @import("event.zig");
 
 const Logger = @import("Logger.zig");
-const RB = PW.SPSC_f32;
+const Epoll = @import("zio/Epoll.zig");
+const EventFd = @import("zio/Eventfd.zig");
 const Client = event.Client;
-const Epoll = zio.Epoll;
+const RB = Audio.RB;
 
 const Sink = @This();
 
 client: *Client,
 logger: *Logger,
 rb: *RB,
-audio: PW,
+audio: *Audio,
 high_tide: bool,
 low_tide: u32,
 
-ack_fd: zio.EventFd,
+ack_fd: EventFd,
 
 pub fn init(client: *Client, logger: *Logger, rb: *RB) !Sink {
     const low_tide_percent = 0.2;
@@ -27,12 +27,9 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB) !Sink {
         .rb = rb,
         .audio = undefined,
         .high_tide = false,
-        .low_tide = @intFromFloat(@as(f32, @floatFromInt(rb._internal.capacity)) * low_tide_percent),
+        .low_tide = @intFromFloat(@as(f32, @floatFromInt(rb.capacity)) * low_tide_percent),
         .ack_fd = try .init(0, 0),
     };
-}
-pub fn deinit(self: *Sink) void {
-    self.audio.deinit();
 }
 
 pub fn err(self: *Sink, erro: anyerror) void {
@@ -40,10 +37,10 @@ pub fn err(self: *Sink, erro: anyerror) void {
     self.client.broadcast_spinning(.err_unrecoverable);
 }
 
-pub fn run(self: *Sink) void {
-    self.audio = PW.init(.{ .channels = 2, .sample_rate = 48000 }, self.rb) catch |e|
+pub fn run(self: *Sink, alloc: std.mem.Allocator) void {
+    self.audio = Audio.init(alloc, .{ .channels = 2, .sample_rate = 48000 }, self.rb) catch |e|
         return self.err(e);
-    defer self.audio.deinit();
+    defer self.audio.deinit(alloc);
     self.audio.pause();
 
     var epoll = Epoll.init(.{}) catch |e|

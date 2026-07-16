@@ -1,11 +1,10 @@
 const std = @import("std");
-const zio = @import("zio");
 const event = @import("event.zig");
 
 const Control = @import("Control.zig");
 const Sink = @import("Sink.zig");
 
-const RB = @import("pw_audio").SPSC_f32;
+const RB = @import("Audio").RB;
 const Logger = @import("Logger.zig");
 const Client = event.Client;
 const Queue = Control.Queue;
@@ -34,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     // Setting up threads
 
     var sink: Sink = try .init(&sink_client, &logger, &rb);
-    var sink_handle = try io.concurrent(Sink.run, .{&sink});
+    var sink_handle = try io.concurrent(Sink.run, .{ &sink, alloc });
     errdefer sink_handle.cancel(io);
 
     var ctrl = Control.init(&ctrl_client, &logger, &rb, sink.ack_fd) orelse return error.NoCtrl;

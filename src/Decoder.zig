@@ -1,7 +1,7 @@
 const std = @import("std");
 const ff = @import("ffmpeg");
 
-const RB = @import("pw_audio").SPSC_f32;
+const RB = @import("Audio").RB;
 const Decoder = @This();
 
 target_channels: i32 = 2,
