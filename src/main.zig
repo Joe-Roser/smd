@@ -7,7 +7,6 @@ const Sink = @import("Sink.zig");
 const RB = @import("Audio").RB;
 const Logger = @import("Logger.zig");
 const Client = event.Client;
-const Queue = Control.Queue;
 
 const stdin = std.Io.File.stdin();
 
