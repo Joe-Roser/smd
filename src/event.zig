@@ -32,28 +32,31 @@ pub fn SPSCClient(comptime E: type, comptime cap: u32) type {
         asleep: u32 = 1,
         fd: EventFd,
 
-        client: *Self,
+        peer: *Self,
 
         pub fn broadcast(self: *Self, event: E) !void {
-            const writer_idx = self.client.writer_idx;
-            if (writer_idx -% self.client.reader_idx >= capacity) return error.WouldBlock;
+            const writer_idx = self.peer.writer_idx;
+            if (writer_idx -% self.peer.reader_idx >= capacity) return error.WouldBlock;
 
-            self.client.events[writer_idx & mask] = event;
-            self.client.writer_idx +%= 1;
+            self.peer.events[writer_idx & mask] = event;
+            self.peer.writer_idx +%= 1;
 
-            if (@atomicLoad(u32, &self.client.asleep, .monotonic) == 1)
-                self.client.fd.write() catch {};
+            if (@atomicLoad(u32, &self.peer.asleep, .monotonic) == 1) {
+                @atomicStore(u32, &self.peer.asleep, 0, .release);
+                self.peer.fd.write() catch {};
+            }
         }
 
         pub fn broadcast_spinning(self: *Self, event: E) void {
-            const writer = self.client.writer_idx;
-            while (writer -% self.client.reader_idx >= capacity) {}
+            const writer = @atomicLoad(u32, &self.peer.writer_idx, .acquire);
+            while (writer -% @atomicLoad(u32, &self.peer.reader_idx, .acquire) >= capacity) {}
 
-            self.client.events[writer & mask] = event;
-            self.client.writer_idx +%= 1;
+            self.peer.events[writer & mask] = event;
+            _ = @atomicRmw(u32, &self.peer.writer_idx, .Add, 1, .acq_rel);
 
-            if (@atomicLoad(u32, &self.client.asleep, .monotonic) == 1) {
-                self.client.fd.write() catch {};
+            if (@atomicLoad(u32, &self.peer.asleep, .monotonic) == 1) {
+                @atomicStore(u32, &self.peer.asleep, 0, .release);
+                self.peer.fd.write() catch {};
             }
         }
 

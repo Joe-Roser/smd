@@ -16,37 +16,6 @@ stream: *pw.pw_stream,
 
 state: State,
 
-// void on_process(void *userdata) {
-//     struct pw_audio_internals *internals = userdata;
-//     ring_buffer* rb = internals->rb;
-//
-//     struct pw_buffer *b = pw_stream_dequeue_buffer(internals->stream);
-//     if (!b) return;
-//
-//
-//     struct spa_buffer *sb = b->buffer;
-//
-//     float *dst = sb->datas[0].data;
-//     int size = sb->datas[0].maxsize / sizeof(float);
-//
-//     if (internals->state == PW_AUDIO_STATE_ZEROED) {
-//         memset(dst, 0, sb->datas[0].maxsize);
-//         sb->datas[0].chunk->size = sb->datas[0].maxsize;
-//         pw_stream_queue_buffer(internals->stream, b);
-//         return;
-//     }
-//
-//     u32 size_read = ring_read(rb, dst, size);
-//
-//     sb->datas[0].chunk->size = size_read * sizeof(float);
-//
-//     pw_stream_queue_buffer(internals->stream, b);
-// }
-//
-// static const struct pw_stream_events stream_events = {
-//     .process = on_process,
-// };
-
 const stream_events: pw.pw_stream_events = .{
     .process = struct {
         fn cb(userdata: ?*anyopaque) callconv(.c) void {
@@ -56,6 +25,7 @@ const stream_events: pw.pw_stream_events = .{
 
             const sb = b.*.buffer;
             var dst: [*]u8 = @ptrCast(sb.*.datas[0].data);
+            // TODO: Use b.requested instead
             const size = sb.*.datas[0].maxsize;
             const num = size / @sizeOf(f32);
 
@@ -78,8 +48,9 @@ const stream_events: pw.pw_stream_events = .{
 
 pub fn init(alloc: std.mem.Allocator, params: Params, rb: *RB) !*Audio {
     var self = try alloc.create(Audio);
+    errdefer alloc.destroy(self);
 
-    pw.pw_init(0, 0);
+    pw.pw_init(null, null);
     errdefer pw.pw_deinit();
 
     self.rb = rb;
@@ -93,7 +64,7 @@ pub fn init(alloc: std.mem.Allocator, params: Params, rb: *RB) !*Audio {
         "Playback",
         pw.PW_KEY_MEDIA_ROLE,
         "Music",
-        @as(u32, 0),
+        @as(?*anyopaque, null),
     );
 
     const loop = pw.pw_main_loop_get_loop(self.loop).?;

@@ -69,7 +69,7 @@ pub fn run(self: *Sink, alloc: std.mem.Allocator) void {
                                 self.audio.zero();
                             },
                             .clear => {
-                                self.audio.pause();
+                                self.audio.zero();
                                 self.audio.clear();
                                 while (true) {
                                     self.ack_fd.write() catch {
@@ -79,6 +79,7 @@ pub fn run(self: *Sink, alloc: std.mem.Allocator) void {
                                     break;
                                 }
                                 self.logger.log("sink cleared", .{}, .debug);
+                                self.high_tide = false;
                             },
                             .high_tide => {
                                 self.high_tide = true;

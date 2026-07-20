@@ -22,22 +22,31 @@ const builtin_level: Level = switch (builtin.mode) {
 };
 
 writer: *std.Io.Writer,
-lock: u32 = 0,
+lock_v: u32 = 0,
 
 pub fn init(w: *std.Io.Writer) Logger {
     return .{ .writer = w };
 }
 pub fn log(self: *Logger, comptime msg: []const u8, args: anytype, comptime level: Level) void {
     if (@intFromEnum(level) < @intFromEnum(builtin_level)) return;
-    var lock = @atomicRmw(u32, &self.lock, .Add, 1, .acq_rel);
-    if (lock != 0) {
-        lock = @atomicLoad(u32, &self.lock, .acquire);
-        while (lock != 1) {
-            lock = @atomicLoad(u32, &self.lock, .acquire);
-        }
-    }
+    self.lock();
+    defer self.unlock();
 
     self.writer.print(level.toString() ++ msg ++ "\n", args) catch
         self.writer.print("Log faliure\n", .{}) catch {};
-    _ = @atomicRmw(u32, &self.lock, .Sub, 1, .release);
+}
+pub inline fn print(self: *Logger, comptime msg: []const u8, args: anytype) void {
+    self.writer.print(msg, args) catch {};
+}
+pub fn lock(self: *Logger) void {
+    var l = @atomicRmw(u32, &self.lock_v, .Add, 1, .acq_rel);
+    if (l != 0) {
+        l = @atomicLoad(u32, &self.lock_v, .acquire);
+        while (l != 1) {
+            l = @atomicLoad(u32, &self.lock_v, .acquire);
+        }
+    }
+}
+pub inline fn unlock(self: *Logger) void {
+    _ = @atomicRmw(u32, &self.lock_v, .Sub, 1, .release);
 }

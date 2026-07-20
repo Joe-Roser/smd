@@ -12,6 +12,8 @@ const stdin = std.Io.File.stdin();
 
 const AudioState = enum(u8) { paused, playing, eof };
 
+const AUDIO_BUFFER_PAGES = 128;
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const alloc = init.gpa;
@@ -20,14 +22,14 @@ pub fn main(init: std.process.Init) !void {
     var stdout_w = stdout.writer(io, &.{});
     var logger: Logger = .init(&stdout_w.interface);
 
-    var rb = try RB.init(128);
+    var rb = try RB.init(AUDIO_BUFFER_PAGES);
     defer rb.deinit();
 
     // Inter thread communications via mpsc channels
 
-    var ctrl_client: Client = .{ .client = undefined, .fd = try .init(1, 0) };
-    var sink_client: Client = .{ .client = &ctrl_client, .fd = try .init(1, 0) };
-    ctrl_client.client = &sink_client;
+    var ctrl_client: Client = .{ .peer = undefined, .fd = try .init(1, 0) };
+    var sink_client: Client = .{ .peer = &ctrl_client, .fd = try .init(1, 0) };
+    ctrl_client.peer = &sink_client;
 
     // Setting up threads
 

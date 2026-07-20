@@ -79,10 +79,10 @@ pub fn add(self: *Epoll, fd: i32, flags: u32, data: Data) !void {
     }
 }
 
-pub fn modify(self: *Epoll, fd: i32, flags: u32) !void {
+pub fn modify(self: *Epoll, fd: i32, data: Data, flags: u32) !void {
     var event: Event = .{
         .events = flags,
-        .data = .{ .fd = fd },
+        .data = data,
     };
 
     const i: isize = @bitCast(linux.epoll_ctl(self.fd, linux.EPOLL.CTL_MOD, fd, &event));

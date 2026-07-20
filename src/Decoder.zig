@@ -97,7 +97,7 @@ pub fn initSong(self: *Decoder, song_path: [*:0]const u8) !void {
             self.codec_ctx.?.sample_rate == self.target_sample_rate and
             self.codec_ctx.?.ch_layout.nb_channels == self.target_channels);
 
-    if (self.needs_resampling) {
+    if (self.needs_resampling)
         try avError(ff.swr_alloc_set_opts2(
             &self.swr,
             &layout,
@@ -109,9 +109,10 @@ pub fn initSong(self: *Decoder, song_path: [*:0]const u8) !void {
             0,
             null,
         ));
+    errdefer if (self.needs_resampling) ff.swr_free(&self.swr);
+
+    if (self.needs_resampling)
         try avError(ff.swr_init(self.swr));
-    }
-    errdefer if (self.swr) |_| ff.swr_free(&self.swr);
 
     self.pts = 0;
 }
@@ -214,6 +215,7 @@ pub fn writeFrame(self: *Decoder, rb: *RB) !bool {
                 @ptrCast(&self.frame.data[0]),
                 self.frame.nb_samples,
             );
+            // TODO: Check Errors
             if (converted <= 0) continue;
 
             n_floats = @intCast(converted * self.target_channels);
