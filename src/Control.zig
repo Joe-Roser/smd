@@ -8,6 +8,7 @@ const Decoder = @import("Decoder.zig");
 const Epoll = @import("zio/Epoll.zig");
 const EventFd = @import("zio/Eventfd.zig");
 const stdin = std.Io.File.stdin();
+const Allocator = std.mem.Allocator;
 
 pub const Queue = LinkedList([:0]const u8);
 const AudioState = enum(u8) { paused, playing, eof };
@@ -45,7 +46,7 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control
         .ack_fd = ack_fd,
     };
 }
-pub fn deinit(self: *Control, alloc: std.mem.Allocator) void {
+pub fn deinit(self: *Control, alloc: Allocator) void {
     self.decoder.deinitSong();
     self.decoder.deinit();
 
@@ -62,7 +63,7 @@ pub fn err(self: *Control, erro: anyerror) void {
 
 /// Initialise the next song in the decoder, repeating untill a song is loaded successfully.
 /// returns true when song is loaded, and false if song path is bad.
-pub fn initSong(self: *Control, alloc: std.mem.Allocator) !bool {
+pub fn initSong(self: *Control, alloc: Allocator) !bool {
     load: while (self.queue.start) |path| {
         // Try load next song
         self.decoder.initSong(path.value) catch |e| switch (e) {
@@ -80,7 +81,7 @@ pub fn initSong(self: *Control, alloc: std.mem.Allocator) !bool {
     return false;
 }
 
-pub fn run(self: *Control, alloc: std.mem.Allocator) void {
+pub fn run(self: *Control, alloc: Allocator) void {
     var epoll = Epoll.init(.{}) catch |e|
         return self.err(e);
     defer epoll.deinit();
@@ -126,137 +127,31 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
 
                     // quit
                     if (std.mem.eql(u8, "q", msg[0 .. m - 1])) {
-                        self.client.broadcast_spinning(.quit);
-                        while (self.queue.popFirst()) |path| {
-                            alloc.free(path.value);
-                            alloc.destroy(path);
-                        }
+                        self.quit(alloc);
                         break :loop;
-                    }
-                    // pause
-                    if (std.mem.eql(u8, "pause", msg[0 .. m - 1])) {
-                        if (self.audio_state == .eof) continue :events;
-
-                        self.audio_state = .paused;
-                        self.client.broadcast_spinning(.pause);
-                        continue :events;
-                    }
-                    // play
-                    if (std.mem.eql(u8, "play", msg[0 .. m - 1])) {
-                        if (self.audio_state == .eof) {
-                            self.logger.log("Play Failed, EOF", .{}, .info);
-                            continue :events;
-                        }
-
-                        self.audio_state = .playing;
-                        self.client.broadcast_spinning(.play);
-                        continue :events;
-                    }
-                    // path
-                    if (std.mem.startsWith(u8, msg[0 .. m - 1], "path: ")) {
-                        // TODO:Check the path
-                        const path = msg[6 .. m - 1];
-                        const path_dupe = alloc.dupeSentinel(u8, path, 0) catch |e|
+                    } else if (std.mem.eql(u8, "pause", msg[0 .. m - 1])) {
+                        self.pause();
+                    } else if (std.mem.eql(u8, "play", msg[0 .. m - 1])) {
+                        self.play();
+                    } else if (std.mem.startsWith(u8, msg[0 .. m - 1], "path: ")) {
+                        self.enqueuePath(alloc, msg[6 .. m - 1]) catch |e|
+                            switch (e) {
+                                error.AV_NOENT => {
+                                    self.logger.log("Song not found", .{}, .info);
+                                },
+                                else => self.err(e),
+                            };
+                    } else if (std.mem.eql(u8, "clear", msg[0 .. m - 1])) {
+                        self.clear(alloc) catch |e|
                             return self.err(e);
-
-                        const node = alloc.create(Queue.Node) catch |e|
+                    } else if (std.mem.eql(u8, "next", msg[0 .. m - 1])) {
+                        self.next(alloc) catch |e|
                             return self.err(e);
-                        node.* = .{ .value = path_dupe };
-
-                        const first_item = self.queue.start;
-                        self.queue.pushLast(node);
-
-                        // If this is the first song in the queue, play it
-                        if (first_item == null) {
-                            self.decoder.initSong(self.queue.start.?.value) catch |e|
-                                switch (e) {
-                                    error.AV_NOENT => {
-                                        self.logger.log("Song not found", .{}, .info);
-                                        continue :events;
-                                    },
-                                    else => self.err(e),
-                                };
-                            self.logger.log("Loaded", .{}, .debug);
-                            // eof was already set
-
-                            self.client.broadcast_spinning(.play);
-                            self.audio_state = .playing;
-                            self.epoll_wait = 0;
-                        }
-                        continue :events;
+                    } else if (std.mem.startsWith(u8, msg[0 .. m - 1], "seek ") and m == 7) {
+                        self.seek(msg[5 .. m - 1]) catch |e|
+                            return self.err(e);
                     }
-                    // clear
-                    if (std.mem.eql(u8, "clear", msg[0 .. m - 1])) {
-                        self.client.broadcast_spinning(.clear);
-                        self.epoll_wait = -1;
-                        self.audio_state = .eof;
-                        while (self.queue.popFirst()) |path| {
-                            alloc.free(path.value);
-                            alloc.destroy(path);
-                        }
-                        self.decoder.deinitSong();
-
-                        self.ack_fd.read() catch |e|
-                            return self.err(e);
-                        self.rb.reset();
-                        continue :events;
-                    }
-                    // next
-                    if (std.mem.eql(u8, "next", msg[0 .. m - 1])) {
-                        if (self.audio_state == .eof) {
-                            self.logger.log("No queued songs", .{}, .info);
-                            continue :events;
-                        }
-
-                        self.client.broadcast_spinning(.clear);
-                        self.decoder.deinitSong();
-
-                        const path = self.queue.popFirst().?;
-                        alloc.free(path.value);
-                        alloc.destroy(path);
-
-                        self.ack_fd.read() catch |e|
-                            return self.err(e);
-                        self.rb.reset();
-
-                        if (!(self.initSong(alloc) catch |e|
-                            return self.err(e)))
-                        {
-                            self.logger.log("Unable to load another song", .{}, .info);
-                            // if no song in queue or all bad paths
-                            self.audio_state = .eof;
-                            self.epoll_wait = -1;
-                        } else if (self.audio_state == .playing) self.client.broadcast_spinning(.play);
-
-                        continue :events;
-                    }
-                    // seek
-                    if (std.mem.startsWith(u8, msg[0 .. m - 1], "seek ") and m == 7) {
-                        const op = if (msg[5] == '+') true else if (msg[5] == '-') false else {
-                            self.logger.log("Usage: 'seek +' or 'seek -'", .{}, .info);
-                            continue :events;
-                        };
-
-                        if (self.audio_state == .eof)
-                            self.logger.log("No song to seek in", .{}, .info);
-
-                        self.client.broadcast_spinning(.clear);
-
-                        const now = self.decoder.pts;
-                        const seek_by = self.decoder.secondsToTimestamp(5) orelse unreachable;
-
-                        const end = if (op) now + seek_by else now - seek_by;
-
-                        self.decoder.seekTo(end) catch |e|
-                            return self.err(e);
-
-                        self.ack_fd.read() catch |e|
-                            return self.err(e);
-                        self.rb.reset();
-
-                        self.client.broadcast_spinning(.play);
-                        continue :events;
-                    }
+                    continue :events;
                 },
                 else => unreachable,
             };
@@ -299,6 +194,111 @@ pub fn run(self: *Control, alloc: std.mem.Allocator) void {
     }
 }
 
+fn quit(self: *Control, alloc: Allocator) void {
+    self.client.broadcast_spinning(.quit);
+    while (self.queue.popFirst()) |path| {
+        alloc.free(path.value);
+        alloc.destroy(path);
+    }
+}
+fn pause(self: *Control) void {
+    if (self.audio_state != .paused) return;
+
+    self.audio_state = .paused;
+    self.client.broadcast_spinning(.pause);
+}
+fn play(self: *Control) void {
+    if (self.audio_state == .eof)
+        // TODO: Error here?
+        return;
+
+    if (self.audio_state == .playing) return;
+
+    self.audio_state = .playing;
+    self.client.broadcast_spinning(.play);
+}
+fn enqueuePath(self: *Control, alloc: Allocator, path: []const u8) !void {
+    // TODO:Check the path
+    const path_dupe = try alloc.dupeSentinel(u8, path, 0);
+
+    const node = try alloc.create(Queue.Node);
+    node.* = .{ .value = path_dupe };
+
+    const first_item = self.queue.start;
+    self.queue.pushLast(node);
+
+    // If this is the first song in the queue, play it
+    if (first_item == null) {
+        try self.decoder.initSong(self.queue.start.?.value);
+        self.logger.log("Loaded", .{}, .debug);
+        // eof was already set
+
+        self.client.broadcast_spinning(.play);
+        self.audio_state = .playing;
+        self.epoll_wait = 0;
+    }
+}
+fn clear(self: *Control, alloc: Allocator) !void {
+    self.client.broadcast_spinning(.clear);
+    self.epoll_wait = -1;
+    self.audio_state = .eof;
+    while (self.queue.popFirst()) |path| {
+        alloc.free(path.value);
+        alloc.destroy(path);
+    }
+    self.decoder.deinitSong();
+
+    try self.ack_fd.read();
+    self.rb.reset();
+}
+fn next(self: *Control, alloc: Allocator) !void {
+    if (self.audio_state == .eof)
+        return error.NoNext;
+
+    self.client.broadcast_spinning(.clear);
+    self.decoder.deinitSong();
+
+    const path = self.queue.popFirst().?;
+    alloc.free(path.value);
+    alloc.destroy(path);
+
+    self.ack_fd.read() catch |e|
+        return self.err(e);
+    self.rb.reset();
+
+    if (!(self.initSong(alloc) catch |e|
+        return self.err(e)))
+    {
+        self.logger.log("Unable to load another song", .{}, .info);
+        // if no song in queue or all bad paths
+        self.audio_state = .eof;
+        self.epoll_wait = -1;
+    } else if (self.audio_state == .playing) self.client.broadcast_spinning(.play);
+}
+fn seek(self: *Control, msg: []const u8) !void {
+    const op = switch (msg[5]) {
+        '-' => false,
+        '+' => true,
+        else => return error.InvalidInput,
+    };
+
+    if (self.audio_state == .eof) return error.NoSongLoaded;
+
+    self.client.broadcast_spinning(.clear);
+
+    const now = self.decoder.pts;
+    const seek_by = self.decoder.secondsToTimestamp(5) orelse unreachable;
+
+    const end = if (op) now + seek_by else now - seek_by;
+
+    try self.decoder.seekTo(end);
+
+    try self.ack_fd.read();
+    self.rb.reset();
+
+    self.client.broadcast_spinning(.play);
+}
+
 fn LinkedList(comptime T: type) type {
     return struct {
         const List = @This();
@@ -334,7 +334,7 @@ fn LinkedList(comptime T: type) type {
             }
             pub fn pushNth(self: *Node, to_push: *Node, n: usize) void {
                 if (n == 0) self.pushNext(to_push);
-                if (self.next) |next| next.pushNth(to_push, n - 1);
+                if (self.next) |next_node| next_node.pushNth(to_push, n - 1);
             }
         };
     };
