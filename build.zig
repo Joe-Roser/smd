@@ -24,6 +24,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addImport("Interface", interface(b, target, optimize));
     exe.root_module.addImport("Audio", audio(b, target, optimize));
     exe.root_module.addImport("ffmpeg", ffmpeg_c.createModule());
 
@@ -61,5 +62,23 @@ fn audio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.
         return pw_audio_mod;
     } else {
         std.debug.panic("Unrecognised audio backend supplied: {s}", .{backend});
+    }
+}
+
+fn interface(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const frontend = b.option([]const u8, "interface", "The user interface to receive on") orelse "term";
+    const messages = b.createModule(.{ .root_source_file = b.path("src/interface/Messages.zig"), .target = target, .optimize = optimize });
+
+    if (std.mem.eql(u8, "term", frontend)) {
+        const term_if = b.createModule(.{
+            .root_source_file = b.path("src/interface/term/Term.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        term_if.addImport("interface", messages);
+        return term_if;
+    } else {
+        std.debug.panic("Unrecognised user interface supplied: {s}", .{frontend});
     }
 }

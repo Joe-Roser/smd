@@ -1,6 +1,7 @@
 const std = @import("std");
 const event = @import("event.zig");
 
+const Interface = @import("Interface");
 const Client = event.Client;
 const Logger = @import("Logger.zig");
 const RB = @import("Audio").RB;
@@ -11,11 +12,13 @@ const stdin = std.Io.File.stdin();
 const Allocator = std.mem.Allocator;
 
 const AudioState = enum(u8) { paused, playing };
+const DecoderState = enum(i32) { idle = -1, decoding = 0 };
 
 const TL_LEN = 2048;
 
 pub const Control = @This();
 
+interface: *Interface,
 client: *Client,
 logger: *Logger,
 rb: *RB,
@@ -28,14 +31,15 @@ decoder: Decoder,
 audio_state: AudioState,
 
 high_tide: u32,
-epoll_wait: i32,
+decoder_state: DecoderState,
 
 ack_fd: EventFd,
 
-pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
+pub fn init(interface: *Interface, client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
+        .interface = interface,
         .client = client,
         .logger = logger,
         .rb = rb,
@@ -45,10 +49,9 @@ pub fn init(client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control
         .tl_max = 0,
 
         .decoder = Decoder.init() orelse return null,
-        .audio_state = .paused,
-
         .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb.capacity)) * high_tide_percent),
-        .epoll_wait = -1,
+        .decoder_state = .idle,
+        .audio_state = .paused,
 
         .ack_fd = ack_fd,
     };
@@ -100,7 +103,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
     var events: [8]Epoll.Event = undefined;
 
     loop: while (true) {
-        const n = epoll.wait(&events, self.epoll_wait) catch
+        const n = epoll.wait(&events, @intFromEnum(self.decoder_state)) catch
             continue :loop;
 
         events: for (events[0..n]) |ev|
@@ -117,80 +120,89 @@ pub fn run(self: *Control, alloc: Allocator) void {
                                 break :loop;
                             },
                             .low_tide => {
-                                if (self.tl_current != self.tl_max) self.epoll_wait = 0;
+                                if (self.tl_current != self.tl_max) self.decoder_state = .decoding;
                             },
                             .high_tide, .play, .pause, .clear, .zero, .quit => unreachable,
                         }
                     }
                 },
                 1 => {
-                    var msg_buf: [1024]u8 = undefined;
-                    const m = std.os.linux.read(stdin.handle, &msg_buf, msg_buf.len);
-                    const msg = std.mem.trim(u8, msg_buf[0..m], " \r\n");
-
-                    // quit
-                    if (std.mem.eql(u8, "q", msg)) {
-                        self.quit();
-                        break :loop;
-                    } else if (std.mem.eql(u8, "state", msg)) {
-                        self.logger.log("state: {}\ncurrent_track: {}/{}", .{
-                            self.audio_state,
-                            self.tl_current,
-                            self.tl_max,
-                        }, .info);
-                    } else if (std.mem.eql(u8, "pause", msg)) {
-                        self.pause();
-                    } else if (std.mem.eql(u8, "play", msg)) {
-                        self.play();
-                    } else if (std.mem.eql(u8, "playPause", msg)) {
-                        self.playPause();
-                    } else if (std.mem.startsWith(u8, msg, "path: ")) {
-                        self.enqueuePath(alloc, msg[6..]) catch |e|
-                            switch (e) {
-                                error.AV_NOENT => {
-                                    self.logger.log("Song not found", .{}, .info);
-                                },
-                                else => self.err(e),
+                    const cmd = self.interface.poll();
+                    switch (cmd) {
+                        .none => {},
+                        .quit => {
+                            self.client.broadcast_spinning(.quit);
+                            self.interface.respond(cmd, .succ);
+                            break :loop;
+                        },
+                        .play => {
+                            self.play();
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .pause => {
+                            self.pause();
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .play_pause => {
+                            self.playPause();
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .enqueue => |path| {
+                            self.enqueuePath(alloc, path) catch |e| {
+                                switch (e) {
+                                    error.AV_NOENT => self.logger.log("Song not found", .{}, .info),
+                                    else => self.err(e),
+                                }
+                                self.interface.respond(cmd, .err);
+                                continue :events;
                             };
-                    } else if (std.mem.eql(u8, "clear", msg)) {
-                        self.clear(alloc) catch |e|
-                            return self.err(e);
-                    } else if (std.mem.eql(u8, "prev", msg)) {
-                        self.prev() catch |e|
-                            return self.err(e);
-                    } else if (std.mem.eql(u8, "next", msg)) {
-                        self.next() catch |e|
-                            return self.err(e);
-                    } else if (std.mem.startsWith(u8, msg, "seekBy ")) {
-                        const by = std.fmt.parseInt(i64, msg[7..], 10) catch {
-                            self.logger.log("Invalid integer: {s}", .{msg[7..]}, .info);
-                            continue :events;
-                        };
-
-                        self.seekBy(by) catch |e|
-                            return self.err(e);
-                    } else if (std.mem.startsWith(u8, msg, "seekTo ")) {
-                        const to = std.fmt.parseInt(i64, msg[7..], 10) catch {
-                            self.logger.log("Invalid integer: {s}", .{msg[7..]}, .info);
-                            continue :events;
-                        };
-                        self.seekTo(to) catch |e|
-                            return self.err(e);
-                    } else if (std.mem.eql(u8, "tracklist", msg)) {
-                        self.tracklist();
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .clear => {
+                            self.clear(alloc) catch |e|
+                                return self.err(e);
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .previous => {
+                            self.prev() catch |e|
+                                return self.err(e);
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .next => {
+                            self.next() catch |e|
+                                return self.err(e);
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .seek_by => |by| {
+                            self.seekBy(by) catch |e|
+                                return self.err(e);
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .seek_to => |to| {
+                            self.seekTo(to) catch |e|
+                                return self.err(e);
+                            self.interface.respond(cmd, .succ);
+                        },
+                        .tracklist => {
+                            self.interface.respond(
+                                cmd,
+                                .{ .tracklist = self.tl[0..self.tl_max] },
+                            );
+                        },
                     }
+
                     continue :events;
                 },
                 else => unreachable,
             };
 
-        if (self.epoll_wait == 0) {
+        if (self.decoder_state == .decoding) {
             for (0..5) |_| {
                 const success = self.decoder.writeFrame(self.rb) catch |write_ret| switch (write_ret) {
                     error.WouldBlock => {
                         self.logger.log("Hit Block", .{}, .debug);
                         self.client.broadcast_spinning(.high_tide);
-                        self.epoll_wait = -1;
+                        self.decoder_state = .idle;
                         continue :loop;
                     },
                     else => return self.err(write_ret),
@@ -206,13 +218,13 @@ pub fn run(self: *Control, alloc: Allocator) void {
                     {
                         // if no song in queue or all bad paths
                         self.audio_state = .paused;
-                        self.epoll_wait = -1;
+                        self.decoder_state = .idle;
                     }
                     continue :loop;
                 }
                 if (self.rb.fill() >= self.high_tide) {
                     self.client.broadcast_spinning(.high_tide);
-                    self.epoll_wait = -1;
+                    self.decoder_state = .idle;
                     continue :loop;
                 }
             }
@@ -220,9 +232,6 @@ pub fn run(self: *Control, alloc: Allocator) void {
     }
 }
 
-fn quit(self: *Control) void {
-    self.client.broadcast_spinning(.quit);
-}
 fn pause(self: *Control) void {
     if (self.audio_state == .paused) return;
 
@@ -258,13 +267,13 @@ fn enqueuePath(self: *Control, alloc: Allocator, path: []const u8) !void {
         if (try self.initSong()) {
             self.client.broadcast_spinning(.play);
             self.audio_state = .playing;
-            self.epoll_wait = 0;
+            self.decoder_state = .decoding;
         }
     }
 }
 fn clear(self: *Control, alloc: Allocator) !void {
     self.client.broadcast_spinning(.clear);
-    self.epoll_wait = -1;
+    self.decoder_state = .idle;
     self.audio_state = .paused;
 
     for (0..self.tl_max) |n| {
@@ -292,10 +301,10 @@ fn prev(self: *Control) !void {
 
     if (should_play) {
         self.client.broadcast_spinning(.play);
-        self.epoll_wait = 0;
+        self.decoder_state = .decoding;
         self.audio_state = .playing;
     } else {
-        self.epoll_wait = -1;
+        self.decoder_state = .idle;
         self.audio_state = .paused;
     }
 }
@@ -313,9 +322,9 @@ fn next(self: *Control) !void {
 
     if (should_play) {
         self.client.broadcast_spinning(.play);
-        self.epoll_wait = 0;
+        self.decoder_state = .decoding;
     } else {
-        self.epoll_wait = -1;
+        self.decoder_state = .idle;
         self.audio_state = .paused;
     }
 }
@@ -332,7 +341,7 @@ fn seekTo(self: *Control, to: i64) !void {
     self.rb.reset();
 
     self.client.broadcast_spinning(.play);
-    self.epoll_wait = 0;
+    self.decoder_state = .decoding;
 }
 fn seekBy(self: *Control, by: i64) !void {
     if (self.tl_current == self.tl_max) return error.NoSongLoaded;
@@ -347,18 +356,5 @@ fn seekBy(self: *Control, by: i64) !void {
     self.rb.reset();
 
     self.client.broadcast_spinning(.play);
-    self.epoll_wait = 0;
-}
-fn tracklist(self: *Control) void {
-    self.logger.lock();
-    defer self.logger.unlock();
-
-    self.logger.print("Tracklist:\n", .{});
-    for (0..self.tl_max) |n| {
-        self.logger.print("{}. {s}", .{
-            n,
-            self.tl[n],
-        });
-        if (n == self.tl_current) self.logger.print("<\n", .{}) else self.logger.print("\n", .{});
-    }
+    self.decoder_state = .decoding;
 }
