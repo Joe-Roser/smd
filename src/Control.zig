@@ -148,7 +148,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
                             self.interface.respond(cmd, .succ);
                         },
                         .enqueue => |path| {
-                            self.enqueuePath(alloc, path) catch |e| {
+                            self.openUri(alloc, path) catch |e| {
                                 switch (e) {
                                     error.AV_NOENT => self.logger.log("Song not found", .{}, .info),
                                     else => self.err(e),
@@ -174,12 +174,12 @@ pub fn run(self: *Control, alloc: Allocator) void {
                             self.interface.respond(cmd, .succ);
                         },
                         .seek_by => |by| {
-                            self.seekBy(by) catch |e|
+                            self.seek(by) catch |e|
                                 return self.err(e);
                             self.interface.respond(cmd, .succ);
                         },
                         .seek_to => |to| {
-                            self.seekTo(to) catch |e|
+                            self.setPosition(to) catch |e|
                                 return self.err(e);
                             self.interface.respond(cmd, .succ);
                         },
@@ -232,11 +232,63 @@ pub fn run(self: *Control, alloc: Allocator) void {
     }
 }
 
+// TODO: Add support for endless and repeat
+fn next(self: *Control) !void {
+    if (self.tl_current == self.tl_max) return;
+
+    self.client.broadcast_spinning(.clear);
+
+    self.decoder.deinitSong();
+    self.tl_current += 1;
+    const should_play = try self.initSong() and self.audio_state == .playing;
+
+    try self.ack_fd.read();
+    self.rb.reset();
+
+    if (should_play) {
+        self.client.broadcast_spinning(.play);
+        self.decoder_state = .decoding;
+    } else {
+        self.decoder_state = .idle;
+        self.audio_state = .paused;
+    }
+}
+// TODO: Add support for endless and repeat
+fn prev(self: *Control) !void {
+    if (self.tl_current == 0) return self.setPosition(0);
+
+    self.client.broadcast_spinning(.clear);
+
+    self.decoder.deinitSong();
+    self.tl_current -= 1;
+    const should_play = try self.initSong() and self.audio_state == .playing;
+
+    try self.ack_fd.read();
+    self.rb.reset();
+
+    if (should_play) {
+        self.client.broadcast_spinning(.play);
+        self.decoder_state = .decoding;
+    } else {
+        self.decoder_state = .idle;
+        self.audio_state = .paused;
+    }
+}
 fn pause(self: *Control) void {
     if (self.audio_state == .paused) return;
 
     self.audio_state = .paused;
     self.client.broadcast_spinning(.pause);
+}
+fn stop(self: *Control) void {
+    if (self.audio_state == .playing) self.pause();
+    self.setPosition(self.tl_current, 0);
+}
+fn playPause(self: *Control) void {
+    std.debug.assert(self.audio_state == .playing or self.audio_state == .paused);
+    if (self.tl_current == self.tl_max) return;
+
+    if (self.audio_state == .playing) self.pause() else self.play();
 }
 fn play(self: *Control) void {
     if (self.tl_current == self.tl_max)
@@ -247,29 +299,6 @@ fn play(self: *Control) void {
 
     self.audio_state = .playing;
     self.client.broadcast_spinning(.play);
-}
-fn playPause(self: *Control) void {
-    std.debug.assert(self.audio_state == .playing or self.audio_state == .paused);
-    if (self.tl_current == self.tl_max) return;
-
-    if (self.audio_state == .playing) self.pause() else self.play();
-}
-fn enqueuePath(self: *Control, alloc: Allocator, path: []const u8) !void {
-    if (self.tl_max == 2048) return error.QueueFull;
-    // TODO:Check the path
-    const path_dupe = try alloc.dupeSentinel(u8, path, 0);
-
-    self.tl[self.tl_max] = path_dupe;
-    const is_final_song = self.tl_current == self.tl_max;
-    self.tl_max += 1;
-
-    if (is_final_song) {
-        if (try self.initSong()) {
-            self.client.broadcast_spinning(.play);
-            self.audio_state = .playing;
-            self.decoder_state = .decoding;
-        }
-    }
 }
 fn clear(self: *Control, alloc: Allocator) !void {
     self.client.broadcast_spinning(.clear);
@@ -287,48 +316,28 @@ fn clear(self: *Control, alloc: Allocator) !void {
     try self.ack_fd.read();
     self.rb.reset();
 }
-fn prev(self: *Control) !void {
-    if (self.tl_current == 0) return self.seekTo(0);
+fn seek(self: *Control, by: i64) !void {
+    // TODO: Add seeked signal support
+    if (self.tl_current == self.tl_max) return error.NoSongLoaded;
 
     self.client.broadcast_spinning(.clear);
 
-    self.decoder.deinitSong();
-    self.tl_current -= 1;
-    const should_play = try self.initSong();
+    const now = self.decoder.pts;
+    const end = (self.decoder.secondsToTimestamp(by) orelse unreachable) + now;
+    try self.decoder.seekTo(end);
 
     try self.ack_fd.read();
     self.rb.reset();
 
-    if (should_play) {
-        self.client.broadcast_spinning(.play);
-        self.decoder_state = .decoding;
-        self.audio_state = .playing;
-    } else {
-        self.decoder_state = .idle;
-        self.audio_state = .paused;
-    }
+    self.client.broadcast_spinning(.play);
+    self.decoder_state = .decoding;
 }
-fn next(self: *Control) !void {
-    if (self.tl_current == self.tl_max) return error.NoNext;
+fn setPosition(self: *Control, track_id: u32, to: i64) !void {
+    // TODO: Add seeked signal support
 
-    self.client.broadcast_spinning(.clear);
+    // TODO:Use track_id:
+    _ = track_id;
 
-    self.decoder.deinitSong();
-    self.tl_current += 1;
-    const should_play = try self.initSong();
-
-    try self.ack_fd.read();
-    self.rb.reset();
-
-    if (should_play) {
-        self.client.broadcast_spinning(.play);
-        self.decoder_state = .decoding;
-    } else {
-        self.decoder_state = .idle;
-        self.audio_state = .paused;
-    }
-}
-fn seekTo(self: *Control, to: i64) !void {
     if (self.tl_current == self.tl_max) return error.NoSongLoaded;
     if (to < 0) return error.CannotSeekToNegative;
 
@@ -343,18 +352,20 @@ fn seekTo(self: *Control, to: i64) !void {
     self.client.broadcast_spinning(.play);
     self.decoder_state = .decoding;
 }
-fn seekBy(self: *Control, by: i64) !void {
-    if (self.tl_current == self.tl_max) return error.NoSongLoaded;
+fn openUri(self: *Control, alloc: Allocator, path: []const u8) !void {
+    if (self.tl_max == 2048) return error.QueueFull;
+    // TODO:Check the path
+    const path_dupe = try alloc.dupeSentinel(u8, path, 0);
 
-    self.client.broadcast_spinning(.clear);
+    self.tl[self.tl_max] = path_dupe;
+    const is_final_song = self.tl_current == self.tl_max;
+    self.tl_max += 1;
 
-    const now = self.decoder.pts;
-    const end = (self.decoder.secondsToTimestamp(by) orelse unreachable) + now;
-    try self.decoder.seekTo(end);
-
-    try self.ack_fd.read();
-    self.rb.reset();
-
-    self.client.broadcast_spinning(.play);
-    self.decoder_state = .decoding;
+    if (is_final_song) {
+        if (try self.initSong()) {
+            self.client.broadcast_spinning(.play);
+            self.audio_state = .playing;
+            self.decoder_state = .decoding;
+        }
+    }
 }

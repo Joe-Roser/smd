@@ -23,13 +23,13 @@ Useful
 
 ### Methods
 - [x] Next
-- [ ] Previous
+- [x] Previous
 - [x] Pause
-- [ ] PlayPause
+- [x] PlayPause
 - [ ] Stop
 - [x] Play
 - [x] Seek
-- [ ] SetPosition
+- [x] SetPosition
 - [x] OpenUri
 
 ### Signals

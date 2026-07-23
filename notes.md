@@ -11,6 +11,7 @@ add pulse backend
 
 # [MPRIS](MPRIS.md)
 
-# Cleanup
-Make .clear functions for internal use to simplify - functions for controlling epoll_wait, audio_state and broadcasts
+# Database
+How is the DBUS interface going to interact with the database??
+Do I need my own DBUS interface??
 
