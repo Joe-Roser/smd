@@ -2,18 +2,22 @@ const std = @import("std");
 
 const stdin = std.Io.File.stdin();
 pub const Messages = @import("interface");
-const Interface = @This();
+const Frontend = @This();
 
 read_buffer: [2048]u8,
 
-pub fn init(alloc: std.mem.Allocator) !*Interface {
-    return alloc.create(Interface);
+pub fn init(alloc: std.mem.Allocator) !*Frontend {
+    return alloc.create(Frontend);
 }
-pub fn deinit(self: *Interface, alloc: std.mem.Allocator) void {
+pub fn deinit(self: *Frontend, alloc: std.mem.Allocator) void {
     alloc.destroy(self);
 }
 
-pub fn poll(self: *Interface) Messages.Command {
+pub fn getFd(_: *Frontend) std.posix.fd_t {
+    return stdin.handle;
+}
+
+pub fn poll(self: *Frontend) Messages.Command {
     // TODO: Errors
     const m = std.os.linux.read(stdin.handle, &self.read_buffer, self.read_buffer.len);
     const msg = std.mem.trim(u8, self.read_buffer[0..m], " \r\n");
@@ -62,7 +66,7 @@ pub fn poll(self: *Interface) Messages.Command {
     return .none;
 }
 
-pub fn respond(_: *Interface, cmd: Messages.Command, res: Messages.Response) void {
+pub fn respond(_: *Frontend, cmd: Messages.Command, res: Messages.Response) void {
     switch (res) {
         .succ, .err => {
             std.debug.print("{any} - {any}\n", .{ cmd, res });

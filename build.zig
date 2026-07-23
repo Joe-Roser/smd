@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("Interface", interface(b, target, optimize));
+    exe.root_module.addImport("Frontend", frontend(b, target, optimize));
     exe.root_module.addImport("Audio", audio(b, target, optimize));
     exe.root_module.addImport("ffmpeg", ffmpeg_c.createModule());
 
@@ -36,10 +36,10 @@ pub fn build(b: *std.Build) void {
 }
 
 fn audio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const backend = b.option([]const u8, "audio", "The audio api used to output audio") orelse "pipewire";
+    const backend_op = b.option([]const u8, "audio", "The audio api used to output audio") orelse "pipewire";
     const rb = b.createModule(.{ .root_source_file = b.path("src/audio/RB.zig"), .target = target, .optimize = optimize });
 
-    if (std.mem.eql(u8, "pipewire", backend)) {
+    if (std.mem.eql(u8, "pipewire", backend_op)) {
         // pw c abstraction to avoid ctranslate of pipewire
         const pw_h = b.addTranslateC(.{
             .root_source_file = b.path("src/audio/pipewire/pw.h"),
@@ -60,18 +60,28 @@ fn audio(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.
         pw_audio_mod.linkSystemLibrary("libpipewire-0.3", .{});
 
         return pw_audio_mod;
+    } else if (std.mem.eql(u8, "pulse", backend_op)) {
+        const pulse_audio_mod = b.createModule(.{
+            .root_source_file = b.path("src/audio/pulseaudio/Pulse.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+
+        pulse_audio_mod.addImport("RB", rb);
+
+        return pulse_audio_mod;
     } else {
-        std.debug.panic("Unrecognised audio backend supplied: {s}", .{backend});
+        std.debug.panic("Unrecognised audio backend supplied: {s}", .{backend_op});
     }
 }
 
-fn interface(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    const frontend = b.option([]const u8, "interface", "The user interface to receive on") orelse "term";
-    const messages = b.createModule(.{ .root_source_file = b.path("src/interface/Messages.zig"), .target = target, .optimize = optimize });
+fn frontend(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const frontend_op = b.option([]const u8, "frontend", "The frontend to receive on") orelse "term";
+    const messages = b.createModule(.{ .root_source_file = b.path("src/frontend/Messages.zig"), .target = target, .optimize = optimize });
 
-    if (std.mem.eql(u8, "term", frontend)) {
+    if (std.mem.eql(u8, "term", frontend_op)) {
         const term_if = b.createModule(.{
-            .root_source_file = b.path("src/interface/term/Term.zig"),
+            .root_source_file = b.path("src/frontend/term/Term.zig"),
             .target = target,
             .optimize = optimize,
         });
@@ -79,6 +89,6 @@ fn interface(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         term_if.addImport("interface", messages);
         return term_if;
     } else {
-        std.debug.panic("Unrecognised user interface supplied: {s}", .{frontend});
+        std.debug.panic("Unrecognised frontend supplied: {s}", .{frontend_op});
     }
 }

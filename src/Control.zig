@@ -1,14 +1,13 @@
 const std = @import("std");
 const event = @import("event.zig");
 
-const Interface = @import("Interface");
+const Frontend = @import("Frontend");
 const Client = event.Client;
 const Logger = @import("Logger.zig");
 const RB = @import("Audio").RB;
 const Decoder = @import("Decoder.zig");
 const Epoll = @import("zio/Epoll.zig");
 const EventFd = @import("zio/Eventfd.zig");
-const stdin = std.Io.File.stdin();
 const Allocator = std.mem.Allocator;
 
 // TODO: Add stopped
@@ -19,7 +18,7 @@ const TL_LEN = 2048;
 
 pub const Control = @This();
 
-frontend: *Interface,
+frontend: *Frontend,
 client: *Client,
 logger: *Logger,
 rb: *RB,
@@ -36,7 +35,7 @@ decoder_state: DecoderState,
 
 ack_fd: EventFd,
 
-pub fn init(interface: *Interface, client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
+pub fn init(interface: *Frontend, client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
@@ -97,7 +96,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
 
     epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
         return self.err(e);
-    epoll.add(stdin.handle, Epoll.IN, .{ .u64 = 1 }) catch |e|
+    epoll.add(self.interface.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
         return self.err(e);
 
     var events: [8]Epoll.Event = undefined;

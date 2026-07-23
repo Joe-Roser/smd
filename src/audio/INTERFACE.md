@@ -1,7 +1,14 @@
+const std = @import("std");
+
+pub const RB = @import("RB");
 pub const Params = struct {
     sample_rate: u32,
     channels: u32,
 };
+
+const Audio = @This();
+
+rb: *RB,
 
 pub fn init(alloc: std.mem.Allocator, params: Params, rb: *RB) !*Audio;
 

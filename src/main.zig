@@ -4,7 +4,7 @@ const event = @import("event.zig");
 const Control = @import("Control.zig");
 const Sink = @import("Sink.zig");
 
-const Interface = @import("Interface");
+const Frontend = @import("Frontend");
 
 const RB = @import("Audio").RB;
 const Logger = @import("Logger.zig");
@@ -24,8 +24,8 @@ pub fn main(init: std.process.Init) !void {
     var stdout_w = stdout.writer(io, &.{});
     var logger: Logger = .init(&stdout_w.interface);
 
-    const interface = try Interface.init(alloc);
-    defer interface.deinit(alloc);
+    const frontend = try Frontend.init(alloc);
+    defer frontend.deinit(alloc);
 
     var rb = try RB.init(AUDIO_BUFFER_PAGES);
     defer rb.deinit();
@@ -42,7 +42,7 @@ pub fn main(init: std.process.Init) !void {
     var sink_handle = try io.concurrent(Sink.run, .{ &sink, alloc });
     errdefer sink_handle.cancel(io);
 
-    var ctrl = Control.init(interface, &ctrl_client, &logger, &rb, sink.ack_fd) orelse return error.NoCtrl;
+    var ctrl = Control.init(frontend, &ctrl_client, &logger, &rb, sink.ack_fd) orelse return error.NoCtrl;
     defer ctrl.deinit(alloc);
     ctrl.run(alloc);
 
