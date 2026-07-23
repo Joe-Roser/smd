@@ -246,12 +246,25 @@ pub inline fn getTimeBase(self: *Decoder) ?ff.AVRational {
     const stream = self.fmt_ctx.?.streams[@intCast(self.stream_idx)];
     return stream.*.time_base;
 }
-pub inline fn secondsToTimestamp(self: *Decoder, t: i64) ?i64 {
+pub inline fn microsToTimestamp(self: *Decoder, t: i64) ?i64 {
     return ff.av_rescale_q(
         t,
-        .{ .num = 1, .den = 1 },
+        .{ .num = 1, .den = 1_000_000 },
         self.getTimeBase() orelse return null,
     );
+}
+pub inline fn positionMicros(self: *Decoder) i64 {
+    const tb = self.getTimeBase() orelse return 0;
+    return ff.av_rescale_q(
+        self.pts,
+        tb,
+        .{ .num = 1, .den = 1_000_000 },
+    );
+}
+pub inline fn durationMicros(self: *Decoder) ?i64 {
+    const fmt_ctx = self.fmt_ctx orelse return null;
+    if (fmt_ctx.duration == ff.AV_NOPTS_VALUE) return null;
+    return fmt_ctx.duration; // already in micros
 }
 pub fn seekTo(self: *Decoder, t: i64) !void {
     if (self.fmt_ctx == null or self.codec_ctx == null) return error.NoSongLoaded;

@@ -15,3 +15,6 @@ add pulse backend
 How is the DBUS interface going to interact with the database??
 Do I need my own DBUS interface??
 
+
+Add properties support
+Add notifications
