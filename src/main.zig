@@ -1,18 +1,12 @@
 const std = @import("std");
-const event = @import("event.zig");
 
 const Control = @import("Control.zig");
 const Sink = @import("Sink.zig");
 
 const Frontend = @import("Frontend");
-
 const RB = @import("Audio").RB;
 const Logger = @import("Logger.zig");
-const Client = event.Client;
-
-const stdin = std.Io.File.stdin();
-
-const AudioState = enum(u8) { paused, playing, eof };
+const Client = @import("event.zig").Client;
 
 const AUDIO_BUFFER_PAGES = 128;
 

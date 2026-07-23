@@ -26,8 +26,32 @@ pub fn poll(self: *Frontend) Messages.Command {
     if (std.mem.eql(u8, "q", msg)) {
         return .quit;
     } else if (std.mem.startsWith(u8, msg, "getProp ")) {
-        const prop = std.meta.stringToEnum(Messages.Property, msg[8..]) orelse return .none;
-        return .{ .get_property = prop };
+        const prop = std.meta.stringToEnum(Messages.DynamicProperty, msg[8..]);
+
+        if (prop) |p| { // DynamicProperties
+            return .{ .get_property = p };
+        } else { // StaticProperties
+            const static = std.meta.stringToEnum(Messages.StaticProperty, msg[8..]) orelse {
+                std.debug.print("Property not recognised\n", .{});
+                return .none;
+            };
+            switch (static) {
+                // booleans
+                .can_quit, .fullscreen, .can_set_fullscreen, .can_raise, .has_tracklist, .can_go_next, .can_go_previous, .can_play, .can_pause, .can_seek, .can_control => {
+                    std.debug.print("{}\n", .{@intFromPtr(static.response()) == 1});
+                },
+                //
+                .minimum_rate, .maximum_rate => {
+                    std.debug.print("{}\n", .{@intFromPtr(static.response())});
+                },
+                .identity, .desktop_entry => {
+                    std.debug.print("{s}\n", .{@as(*const []const u8, @ptrCast(@alignCast(static.response()))).*});
+                },
+                .supported_uri_schemes, .supported_mime_types => {
+                    std.debug.print("{any}\n", .{@as(*const []const []const u8, @ptrCast(@alignCast(static.response()))).*});
+                },
+            }
+        }
     } else if (std.mem.eql(u8, "next", msg)) {
         return .next;
     } else if (std.mem.eql(u8, "prev", msg)) {
@@ -71,16 +95,14 @@ pub fn respond(_: *Frontend, cmd: Messages.Command, res: Messages.Response) void
         .succ, .err => {
             std.debug.print("{any} - {any}\n", .{ cmd, res });
         },
-        .property_set => {
-            switch (cmd.get_property) {
-                .playback_status => {
-                    std.debug.print("{s}\n", .{@as(*const []const u8, @ptrCast(@alignCast(res.property_set))).*});
-                },
-                .position => {
-                    std.debug.print("{}\n", .{@as(usize, @intFromPtr(res.property_set))});
-                },
-                else => @panic("Oopa"),
-            }
+        .property_response => |resp| switch (cmd.get_property) {
+            .playback_status => {
+                std.debug.print("{s}\n", .{@as(*const []const u8, @ptrCast(@alignCast(resp))).*});
+            },
+            .position => {
+                std.debug.print("{}\n", .{@as(usize, @intFromPtr(resp))});
+            },
+            else => @panic("Oopa"),
         },
         .tracklist => |tl| {
             for (tl, 0..) |track, i| {
@@ -90,7 +112,7 @@ pub fn respond(_: *Frontend, cmd: Messages.Command, res: Messages.Response) void
     }
 }
 
-pub fn notify(self: *Interface, notification: Messages.Notification) void {
+pub fn notify(self: *Frontend, notification: Messages.Notification) void {
     _ = self;
     std.debug.print("Notification: {any}", .{notification});
 }

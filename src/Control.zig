@@ -11,7 +11,7 @@ const EventFd = @import("zio/Eventfd.zig");
 const Allocator = std.mem.Allocator;
 
 // TODO: Add stopped
-const AudioState = enum(u8) { paused, playing };
+const AudioState = enum(u8) { stopped, paused, playing };
 const DecoderState = enum(i32) { idle = -1, decoding = 0 };
 
 const TL_LEN = 2048;
@@ -35,11 +35,11 @@ decoder_state: DecoderState,
 
 ack_fd: EventFd,
 
-pub fn init(interface: *Frontend, client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
+pub fn init(frontend: *Frontend, client: *Client, logger: *Logger, rb: *RB, ack_fd: EventFd) ?Control {
     const high_tide_percent = 0.9;
 
     return .{
-        .frontend = interface,
+        .frontend = frontend,
         .client = client,
         .logger = logger,
         .rb = rb,
@@ -51,7 +51,7 @@ pub fn init(interface: *Frontend, client: *Client, logger: *Logger, rb: *RB, ack
         .decoder = Decoder.init() orelse return null,
         .high_tide = @intFromFloat(@as(f32, @floatFromInt(rb.capacity)) * high_tide_percent),
         .decoder_state = .idle,
-        .audio_state = .paused,
+        .audio_state = .stopped,
 
         .ack_fd = ack_fd,
     };
@@ -96,7 +96,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
 
     epoll.add(self.client.fd.fd, Epoll.IN, .{ .u64 = 0 }) catch |e|
         return self.err(e);
-    epoll.add(self.interface.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
+    epoll.add(self.frontend.getFd(), Epoll.IN, .{ .u64 = 1 }) catch |e|
         return self.err(e);
 
     var events: [8]Epoll.Event = undefined;
@@ -136,7 +136,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
                         },
                         .get_property => |p| {
                             const prop = self.getProperty(p);
-                            self.frontend.respond(cmd, .{ .property_set = prop });
+                            self.frontend.respond(cmd, .{ .property_response = prop });
                         },
 
                         .next => {
@@ -183,16 +183,17 @@ pub fn run(self: *Control, alloc: Allocator) void {
                                 return self.err(e);
                         },
 
-                        // enqueue
-                        //    self.enqueue(alloc, path) catch |e| {
-                        //        switch (e) {
-                        //            error.AV_NOENT => self.logger.log("Song not found", .{}, .info),
-                        //            else => self.err(e),
-                        //        }
-                        //        self.interface.respond(cmd, .err);
-                        //        continue :events;
-                        //    };
-                        //    self.interface.respond(cmd, .succ);
+                        .enqueue => |path| {
+                            self.enqueue(alloc, path) catch |e| {
+                                switch (e) {
+                                    error.AV_NOENT => self.logger.log("Song not found", .{}, .info),
+                                    else => self.err(e),
+                                }
+                                self.frontend.respond(cmd, .err);
+                                continue :events;
+                            };
+                            self.frontend.respond(cmd, .succ);
+                        },
                         .clear => {
                             self.clear(alloc) catch |e|
                                 return self.err(e);
@@ -232,7 +233,7 @@ pub fn run(self: *Control, alloc: Allocator) void {
                         return self.err(e)))
                     {
                         // if no song in queue or all bad paths
-                        self.audio_state = .paused;
+                        self.audio_state = .stopped;
                         self.decoder_state = .idle;
                     }
                     continue :loop;
@@ -247,13 +248,15 @@ pub fn run(self: *Control, alloc: Allocator) void {
     }
 }
 
-fn getProperty(self: *Control, property: Interface.Messages.Property) *const anyopaque {
+fn getProperty(self: *Control, property: Frontend.Messages.DynamicProperty) *const anyopaque {
     switch (property) {
         // TODO: Add stopped support
         .playback_status => return @ptrCast(@as(*const []const u8, switch (self.audio_state) {
-            .playing => &"playing",
-            .paused => &"paused",
+            .playing => &"Playing",
+            .paused => &"Paused",
+            .stopped => &"Stopped",
         })),
+        // TODO:Should be float
         .position => return @ptrFromInt(@as(usize, @intCast(self.decoder.positionMicros()))),
         else => std.debug.panic("Not implemented", .{}),
     }
@@ -267,7 +270,8 @@ fn next(self: *Control) !void {
 
     self.decoder.deinitSong();
     self.tl_current += 1;
-    const should_play = try self.initSong() and self.audio_state == .playing;
+    const song_loaded = try self.initSong();
+    const should_play = song_loaded and self.audio_state == .playing;
 
     try self.ack_fd.read();
     self.rb.reset();
@@ -277,8 +281,8 @@ fn next(self: *Control) !void {
         self.decoder_state = .decoding;
     } else {
         self.decoder_state = .idle;
-        self.audio_state = .paused;
     }
+    if (!song_loaded) self.audio_state = .stopped;
 }
 // TODO: Add support for endless and repeat
 fn prev(self: *Control) !void {
@@ -288,7 +292,8 @@ fn prev(self: *Control) !void {
 
     self.decoder.deinitSong();
     self.tl_current -= 1;
-    const should_play = try self.initSong() and self.audio_state == .playing;
+    const song_loaded = try self.initSong();
+    const should_play = song_loaded and self.audio_state == .playing;
 
     try self.ack_fd.read();
     self.rb.reset();
@@ -298,8 +303,8 @@ fn prev(self: *Control) !void {
         self.decoder_state = .decoding;
     } else {
         self.decoder_state = .idle;
-        self.audio_state = .paused;
     }
+    if (!song_loaded) self.audio_state = .stopped;
 }
 fn pause(self: *Control) void {
     if (self.audio_state == .paused) return;
@@ -312,17 +317,19 @@ fn stop(self: *Control) !void {
 
     if (self.audio_state == .playing) self.pause();
     try self.setPosition(self.tl_current, 0);
+    self.audio_state = .stopped;
 }
 fn playPause(self: *Control) void {
-    std.debug.assert(self.audio_state == .playing or self.audio_state == .paused);
+    // Compile error if another state is added
+    switch (self.audio_state) {
+        .stopped, .paused, .playing => {},
+    }
     if (self.tl_current == self.tl_max) return;
 
     if (self.audio_state == .playing) self.pause() else self.play();
 }
 fn play(self: *Control) void {
-    if (self.tl_current == self.tl_max)
-        // eof
-        return;
+    if (self.tl_current == self.tl_max) return;
 
     if (self.audio_state == .playing) return;
 
@@ -332,7 +339,7 @@ fn play(self: *Control) void {
 fn clear(self: *Control, alloc: Allocator) !void {
     self.client.broadcast_spinning(.clear);
     self.decoder_state = .idle;
-    self.audio_state = .paused;
+    self.audio_state = .stopped;
 
     for (0..self.tl_max) |n| {
         alloc.free(self.tl[n]);
@@ -394,6 +401,9 @@ fn openUri(self: *Control, alloc: Allocator, path: []const u8) !void {
         self.client.broadcast_spinning(.play);
         self.audio_state = .playing;
         self.decoder_state = .decoding;
+    } else {
+        self.audio_state = .stopped;
+        self.decoder_state = .idle;
     }
 }
 
